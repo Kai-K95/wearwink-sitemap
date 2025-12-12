@@ -1,101 +1,84 @@
-import os
 import re
-import time
-import datetime
-from urllib.parse import urljoin, urlparse, urlencode, parse_qs
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
 
-import requests
-
-
-# === CONFIG ===
-SHOP_URL = os.getenv("SHOP_URL", "https://www.redbubble.com/people/wearwink/shop?asc=u")
-MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))          # wie viele Shop-Seiten wir versuchen
-SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1")) # Pause zwischen Seiten (freundlicher)
-OUTFILE = os.getenv("OUTFILE", "sitemap.xml")
-
-# GitHub Pages Base-URL deines Repos (für robots.txt / Hinweise)
-PAGES_BASE = os.getenv("PAGES_BASE", "https://kai-k95.github.io/wearwink-sitemap")
-
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+from playwright.sync_api import sync_playwright
 
 
-def fetch_html(url: str) -> str:
-    """
-    Versucht zuerst normal zu holen.
-    Wenn geblockt/leer: Holt über r.jina.ai mit x-respond-with: html
-    (liefert documentElement.outerHTML)  -> enthält die /i/ Links.
-    """
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+SHOP_URL = "https://wearwink.redbubble.com/shop"  # dein Shop
+OUT_SITEMAP = Path("sitemap.xml")
+OUT_INDEX = Path("index.html")
 
+
+def _is_valid_url(u: str) -> bool:
     try:
-        r = s.get(url, timeout=30)
-        if r.status_code == 200 and "/i/" in r.text:
-            return r.text
+        p = urlparse(u)
+        return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
-        pass
-
-    # Fallback: Jina Reader (HTML Mode)
-    jina_url = "https://r.jina.ai/" + url
-    headers = {
-        "User-Agent": UA,
-        "x-respond-with": "html",          # <- wichtig: echtes HTML zurückgeben
-        "x-no-cache": "true",
-        "x-timeout": "30",
-        # warte bis Produktlinks im DOM sind (CSS selector)
-        "x-wait-for-selector": 'a[href*="/i/"]',
-    }
-    r2 = requests.get(jina_url, headers=headers, timeout=60)
-    r2.raise_for_status()
-    return r2.text
+        return False
 
 
-def with_page(url: str, page: int) -> str:
-    """Fügt page= hinzu/ändert es (Redbubble shop akzeptiert meist page=)."""
-    u = urlparse(url)
-    q = parse_qs(u.query)
-    q["page"] = [str(page)]
-    new_query = urlencode(q, doseq=True)
-    return u._replace(query=new_query).geturl()
+def collect_product_links() -> list[str]:
+    links: set[str] = set()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+            locale="de-DE",
+        )
+        page = context.new_page()
+
+        page.goto(SHOP_URL, wait_until="domcontentloaded", timeout=90_000)
+
+        # Cookie/Consent Banner (falls vorhanden) entschärfen
+        try:
+            page.get_by_role("button", name=re.compile(r"(accept|agree|zustimmen|alle akzeptieren)", re.I)).click(timeout=3000)
+        except Exception:
+            pass
+
+        # kurz warten, damit Grid initial lädt
+        page.wait_for_timeout(2500)
+
+        # Scrollen, bis keine neuen Items mehr kommen
+        last_height = 0
+        for _ in range(40):
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1500)
+            height = page.evaluate("document.body.scrollHeight")
+            if height == last_height:
+                break
+            last_height = height
+
+        # Produktseiten sind typischerweise /i/<product>/...
+        hrefs = page.eval_on_selector_all(
+            'a[href*="/i/"]',
+            "els => els.map(e => e.href)"
+        )
+
+        for h in hrefs:
+            if isinstance(h, str) and _is_valid_url(h):
+                links.add(h.split("#")[0])
+
+        context.close()
+        browser.close()
+
+    return sorted(links)
 
 
-def extract_product_urls(html: str) -> set[str]:
-    """
-    Holt alle Redbubble Produkt-URLs aus dem HTML.
-    Produktseiten sind typischerweise /i/<product>/.../<id>....
-    """
-    urls = set()
+def write_sitemap(urls: list[str]) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # href=".../i/..."
-    for m in re.finditer(r'href="([^"]*?/i/[^"]+)"', html):
-        href = m.group(1)
-        urls.add(href)
-
-    # Falls Reader Links als Markdown o.ä. liefert:
-    for m in re.finditer(r"\((https?://[^)]+/i/[^)]+)\)", html):
-        urls.add(m.group(1))
-
-    # Normalize (relative -> absolute, remove fragments)
-    cleaned = set()
-    for u in urls:
-        abs_u = urljoin("https://www.redbubble.com", u)
-        abs_u = abs_u.split("#", 1)[0]
-        cleaned.add(abs_u)
-
-    # Nur echte Produktseiten behalten
-    cleaned = {u for u in cleaned if "redbubble.com/i/" in u}
-    return cleaned
-
-
-def write_sitemap(urls: list[str], outfile: str) -> None:
-    now = datetime.datetime.utcnow().date().isoformat()
-    lines = []
-    lines.append('<?xml version="1.0" encoding="UTF-8"?>')
-    lines.append('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">')
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ]
 
     for u in urls:
         lines.append("  <url>")
@@ -104,43 +87,35 @@ def write_sitemap(urls: list[str], outfile: str) -> None:
         lines.append("  </url>")
 
     lines.append("</urlset>")
-    with open(outfile, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_index(urls: list[str]) -> None:
+    OUT_INDEX.write_text(
+        f"""<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WearWink – Sitemap</title>
+</head>
+<body>
+  <h1>WearWink – Sitemap</h1>
+  <p>Gefundene Produkt-URLs: <strong>{len(urls)}</strong></p>
+  <p><a href="sitemap.xml">➡️ sitemap.xml öffnen</a></p>
+  <p>Letztes Update: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}</p>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
 
 
 def main():
-    all_urls = set()
-    empty_streak = 0
-
-    for page in range(1, MAX_PAGES + 1):
-        url = with_page(SHOP_URL, page)
-        html = fetch_html(url)
-        found = extract_product_urls(html)
-
-        new = found - all_urls
-        all_urls |= found
-
-        print(f"[page {page}] found={len(found)} new={len(new)} total={len(all_urls)}")
-
-        if len(found) == 0 or len(new) == 0:
-            empty_streak += 1
-        else:
-            empty_streak = 0
-
-        # Wenn 2 Seiten hintereinander nichts Neues liefern -> abbrechen
-        if empty_streak >= 2 and page >= 2:
-            break
-
-        time.sleep(SLEEP_SECONDS)
-
-    urls_sorted = sorted(all_urls)
-    write_sitemap(urls_sorted, OUTFILE)
-
-    # kleine Hilfsdatei für dich/Debug
-    with open("last_count.txt", "w", encoding="utf-8") as f:
-        f.write(str(len(urls_sorted)) + "\n")
-
-    print(f"✅ sitemap written: {OUTFILE} ({len(urls_sorted)} urls)")
+    urls = collect_product_links()
+    write_sitemap(urls)
+    write_index(urls)
+    print(f"Found {len(urls)} product URLs.")
 
 
 if __name__ == "__main__":
