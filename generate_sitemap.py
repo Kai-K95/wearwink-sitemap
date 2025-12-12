@@ -1,129 +1,147 @@
+import os
 import re
 import time
-from urllib.parse import urljoin, urlencode
-from datetime import datetime, timezone
+import datetime
+from urllib.parse import urljoin, urlparse, urlencode, parse_qs
 
 import requests
-from bs4 import BeautifulSoup
 
-BASE = "https://www.redbubble.com"
-SHOP_USER = "wearwink"
 
-MAX_PAGES = 200          # max. Seiten, die er versucht
-SLEEP = 1.5              # Pause zwischen Seiten (sek)
+# === CONFIG ===
+SHOP_URL = os.getenv("SHOP_URL", "https://www.redbubble.com/people/wearwink/shop?asc=u")
+MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))          # wie viele Shop-Seiten wir versuchen
+SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1")) # Pause zwischen Seiten (freundlicher)
+OUTFILE = os.getenv("OUTFILE", "sitemap.xml")
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-})
+# GitHub Pages Base-URL deines Repos (für robots.txt / Hinweise)
+PAGES_BASE = os.getenv("PAGES_BASE", "https://kai-k95.github.io/wearwink-sitemap")
 
-def fetch(page: int) -> str:
-    params = {"asc": "u"}  # sort (wie bei dir getestet)
-    if page > 1:
-        params["page"] = str(page)
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
-    url = f"{BASE}/people/{SHOP_USER}/shop?{urlencode(params)}"
-    r = session.get(url, timeout=30)
 
-    # Redbubble blockt GitHub Actions häufig (403) -> Proxy-Fallback:
-    if r.status_code == 403:
-        proxy_url = "https://r.jina.ai/" + url
-        r = session.get(proxy_url, timeout=30)
+def fetch_html(url: str) -> str:
+    """
+    Versucht zuerst normal zu holen.
+    Wenn geblockt/leer: Holt über r.jina.ai mit x-respond-with: html
+    (liefert documentElement.outerHTML)  -> enthält die /i/ Links.
+    """
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
 
-    r.raise_for_status()
-    return r.text
+    try:
+        r = s.get(url, timeout=30)
+        if r.status_code == 200 and "/i/" in r.text:
+            return r.text
+    except Exception:
+        pass
 
-def normalize_rb_url(u: str) -> str | None:
-    u = u.strip().strip('"').strip("'")
-    if not u:
-        return None
+    # Fallback: Jina Reader (HTML Mode)
+    jina_url = "https://r.jina.ai/" + url
+    headers = {
+        "User-Agent": UA,
+        "x-respond-with": "html",          # <- wichtig: echtes HTML zurückgeben
+        "x-no-cache": "true",
+        "x-timeout": "30",
+        # warte bis Produktlinks im DOM sind (CSS selector)
+        "x-wait-for-selector": 'a[href*="/i/"]',
+    }
+    r2 = requests.get(jina_url, headers=headers, timeout=60)
+    r2.raise_for_status()
+    return r2.text
 
-    # Voll-URL sicherstellen
-    if u.startswith("//"):
-        u = "https:" + u
-    elif u.startswith("/"):
-        u = urljoin(BASE, u)
 
-    # Query entfernen
-    u = u.split("?")[0]
+def with_page(url: str, page: int) -> str:
+    """Fügt page= hinzu/ändert es (Redbubble shop akzeptiert meist page=)."""
+    u = urlparse(url)
+    q = parse_qs(u.query)
+    q["page"] = [str(page)]
+    new_query = urlencode(q, doseq=True)
+    return u._replace(query=new_query).geturl()
 
-    # Nur Redbubble Produktseiten behalten
-    if not u.startswith("https://www.redbubble.com/"):
-        return None
-    if "/i/" not in u:
-        return None
-
-    return u
 
 def extract_product_urls(html: str) -> set[str]:
-    urls: set[str] = set()
+    """
+    Holt alle Redbubble Produkt-URLs aus dem HTML.
+    Produktseiten sind typischerweise /i/<product>/.../<id>....
+    """
+    urls = set()
 
-    # 1) Klassisch: Links aus <a href="...">
-    soup = BeautifulSoup(html, "lxml")
-    for a in soup.find_all("a", href=True):
-        nu = normalize_rb_url(a["href"])
-        if nu:
-            urls.add(nu)
+    # href=".../i/..."
+    for m in re.finditer(r'href="([^"]*?/i/[^"]+)"', html):
+        href = m.group(1)
+        urls.add(href)
 
-    # 2) Robust: Produkt-URLs direkt aus dem HTML-Text ziehen (Regex)
-    # (hilft, wenn Redbubble Links nicht als <a> rendert oder Proxy-HTML anders ist)
-    patterns = [
-        r"https?://www\.redbubble\.com/i/[^\s\"\'<>]+",
-        r"//www\.redbubble\.com/i/[^\s\"\'<>]+",
-        r"\/i\/[^\s\"\'<>]+",
-    ]
-    for pat in patterns:
-        for m in re.findall(pat, html):
-            nu = normalize_rb_url(m)
-            if nu:
-                urls.add(nu)
+    # Falls Reader Links als Markdown o.ä. liefert:
+    for m in re.finditer(r"\((https?://[^)]+/i/[^)]+)\)", html):
+        urls.add(m.group(1))
 
-    return urls
+    # Normalize (relative -> absolute, remove fragments)
+    cleaned = set()
+    for u in urls:
+        abs_u = urljoin("https://www.redbubble.com", u)
+        abs_u = abs_u.split("#", 1)[0]
+        cleaned.add(abs_u)
 
-def write_sitemap(urls: list[str], out_path: str = "sitemap.xml"):
-    lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Nur echte Produktseiten behalten
+    cleaned = {u for u in cleaned if "redbubble.com/i/" in u}
+    return cleaned
 
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-    ]
+
+def write_sitemap(urls: list[str], outfile: str) -> None:
+    now = datetime.datetime.utcnow().date().isoformat()
+    lines = []
+    lines.append('<?xml version="1.0" encoding="UTF-8"?>')
+    lines.append('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">')
+
     for u in urls:
         lines.append("  <url>")
         lines.append(f"    <loc>{u}</loc>")
-        lines.append(f"    <lastmod>{lastmod}</lastmod>")
+        lines.append(f"    <lastmod>{now}</lastmod>")
         lines.append("  </url>")
-    lines.append("</urlset>")
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    lines.append("</urlset>")
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
 
 def main():
-    all_urls: set[str] = set()
-    prev_count = 0
+    all_urls = set()
+    empty_streak = 0
 
     for page in range(1, MAX_PAGES + 1):
-        html = fetch(page)
+        url = with_page(SHOP_URL, page)
+        html = fetch_html(url)
         found = extract_product_urls(html)
+
+        new = found - all_urls
         all_urls |= found
 
-        print(f"page {page}: +{len(found)} (total {len(all_urls)})")
+        print(f"[page {page}] found={len(found)} new={len(new)} total={len(all_urls)}")
 
-        # Stop, wenn sich nichts mehr ändert
-        if len(all_urls) == prev_count:
+        if len(found) == 0 or len(new) == 0:
+            empty_streak += 1
+        else:
+            empty_streak = 0
+
+        # Wenn 2 Seiten hintereinander nichts Neues liefern -> abbrechen
+        if empty_streak >= 2 and page >= 2:
             break
-        prev_count = len(all_urls)
 
-        time.sleep(SLEEP)
+        time.sleep(SLEEP_SECONDS)
 
     urls_sorted = sorted(all_urls)
-    write_sitemap(urls_sorted, "sitemap.xml")
+    write_sitemap(urls_sorted, OUTFILE)
 
-    with open("urls.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(urls_sorted))
+    # kleine Hilfsdatei für dich/Debug
+    with open("last_count.txt", "w", encoding="utf-8") as f:
+        f.write(str(len(urls_sorted)) + "\n")
 
-    print(f"OK: {len(urls_sorted)} product URLs")
+    print(f"✅ sitemap written: {OUTFILE} ({len(urls_sorted)} urls)")
+
 
 if __name__ == "__main__":
     main()
