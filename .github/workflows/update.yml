@@ -12,11 +12,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -29,10 +27,20 @@ jobs:
       - name: Generate sitemap
         run: python generate_sitemap.py
 
+      - name: Upload debug (if exists)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: |
+            debug_page1.html
+            debug_page1.png
+          if-no-files-found: ignore
+
       - name: Commit changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sitemap.xml last_count.txt
+          git add sitemap.xml last_count.txt index.html debug_page1.html debug_page1.png || true
           git diff --cached --quiet || git commit -m "Update sitemap"
           git push
