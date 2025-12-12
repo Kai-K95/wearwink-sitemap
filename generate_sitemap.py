@@ -91,8 +91,9 @@ def write_sitemap(urls: list[str]) -> None:
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
     for u in urls:
+        u_xml = u.replace("&", "&amp;")
         lines.append("  <url>")
-        lines.append(f"    <loc>{u}</loc>")
+        lines.append(f"    <loc>{u_xml}</loc>")
         lines.append(f"    <lastmod>{lastmod}</lastmod>")
         lines.append("  </url>")
     lines.append("</urlset>")
