@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
+import shutil
 
+# === DEINE KONFIG ===
+SITE_BASE = "https://kai-k95.github.io/wearwink-sitemap"
 RB_BASE = "https://www.redbubble.com"
 USERNAME = "WearWink"
 ASC = "u"
@@ -50,27 +53,46 @@ IA_CODES = [
     "u-bag-studiopouch",
 ]
 
+# === OUTPUTS ===
 OUT_SITEMAP = Path("sitemap.xml")
-OUT_URLS = Path("urls.txt")
 OUT_COUNT = Path("last_count.txt")
 OUT_INDEX = Path("index.html")
+PAGES_DIR = Path("c")  # -> /c/<iaCode>/index.html
 
 
-def build_category_url(ia_code: str) -> str:
-    # Nur Seed-URL (page=1). BlogToPin findet Pagination/Unterseiten selbst.
+def rb_category_url(ia_code: str) -> str:
     params = {
         "artistUserName": USERNAME,
         "asc": ASC,
-        "page": 1,
+        "page": 1,  # nur Kategorie-Seed
         "sortOrder": SORT,
         "iaCode": ia_code,
     }
     return f"{RB_BASE}/people/{USERNAME}/shop?{urlencode(params)}"
 
 
-def xml_escape(s: str) -> str:
-    # Für <loc> muss & zu &amp; werden, sonst ist sitemap.xml kaputt
-    return s.replace("&", "&amp;")
+def local_category_url(ia_code: str) -> str:
+    # Wichtig: BlogToPin bekommt nur DEINE Domain in der Sitemap
+    return f"{SITE_BASE}/c/{ia_code}/"
+
+
+def write_redirect_page(path: Path, target: str, title: str) -> None:
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{title}</title>
+  <meta name="robots" content="noindex">
+  <link rel="canonical" href="{target}">
+  <meta http-equiv="refresh" content="0; url={target}">
+  <script>window.location.replace({target!r});</script>
+</head>
+<body>
+  <p>Redirecting to <a href="{target}">{target}</a></p>
+</body>
+</html>
+"""
+    path.write_text(html, encoding="utf-8")
 
 
 def write_sitemap(urls: list[str]) -> None:
@@ -80,8 +102,10 @@ def write_sitemap(urls: list[str]) -> None:
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
     for u in urls:
+        # local URLs haben keine &, trotzdem safe:
+        u_xml = u.replace("&", "&amp;")
         lines.append("  <url>")
-        lines.append(f"    <loc>{xml_escape(u)}</loc>")
+        lines.append(f"    <loc>{u_xml}</loc>")
         lines.append(f"    <lastmod>{lastmod}</lastmod>")
         lines.append("  </url>")
     lines.append("</urlset>")
@@ -89,28 +113,31 @@ def write_sitemap(urls: list[str]) -> None:
 
 
 def main():
-    urls = [build_category_url(ia) for ia in IA_CODES]
-    # optional: sort+dedupe
-    urls = sorted(set(urls))
+    # alte Redirect-Seiten entfernen
+    if PAGES_DIR.exists():
+        shutil.rmtree(PAGES_DIR)
 
-    # outputs
-    OUT_URLS.write_text("\n".join(urls) + "\n", encoding="utf-8")
-    OUT_COUNT.write_text(str(len(urls)) + "\n", encoding="utf-8")
+    urls = []
+    for ia in IA_CODES:
+        target = rb_category_url(ia)
+        out_dir = PAGES_DIR / ia
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_redirect_page(out_dir / "index.html", target, title=f"{ia} category")
+        urls.append(local_category_url(ia))
+
+    urls = sorted(set(urls))
     write_sitemap(urls)
+    OUT_COUNT.write_text(str(len(urls)) + "\n", encoding="utf-8")
 
     OUT_INDEX.write_text(
         "<!doctype html><meta charset='utf-8'>"
         "<h1>WearWink Category Seeds</h1>"
         f"<p>Count: <b>{len(urls)}</b></p>"
-        "<ul>"
-        "<li><a href='sitemap.xml'>sitemap.xml</a></li>"
-        "<li><a href='urls.txt'>urls.txt</a></li>"
-        "<li><a href='last_count.txt'>last_count.txt</a></li>"
-        "</ul>",
+        "<p><a href='sitemap.xml'>sitemap.xml</a> | <a href='last_count.txt'>last_count.txt</a></p>",
         encoding="utf-8",
     )
 
-    print(f"✅ OK: wrote {len(urls)} category seed URLs")
+    print(f"✅ OK: wrote {len(urls)} category redirect pages")
 
 
 if __name__ == "__main__":
