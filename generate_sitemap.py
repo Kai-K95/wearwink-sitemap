@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import random
+import shutil
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
+# === Einstellungen ===
+SITE_BASE = "https://kai-k95.github.io/wearwink-sitemap"  # dein GitHub Pages Base
+ARTIST = "WearWink"
+RB_BASE = f"https://www.redbubble.com/people/{ARTIST}/shop"
+
+TOTAL_URLS = 2000                 # Gesamtlimit (wie von dir gewünscht)
+POOL_PAGES_PER_CATEGORY = 200     # aus wie vielen Seiten wir pro Kategorie "ziehen" (Rotation)
+# =====================
+
 OUT_SITEMAP = Path("sitemap.xml")
 OUT_COUNT = Path("last_count.txt")
+C_DIR = Path("c")
 
-ARTIST = "WearWink"
-BASE = f"https://www.redbubble.com/people/{ARTIST}/shop"
-
-# Deine Produktkategorien (iaCode) – bitte hier pflegen
 IA_CODES = [
     "w-dresses",
     "u-sweatshirts",
@@ -52,9 +61,7 @@ IA_CODES = [
     "u-bag-studiopouch",
 ]
 
-PAGES_PER_CATEGORY = 53  # “immer 53 Seiten”
-
-def build_url(page: int, ia_code: str) -> str:
+def rb_url(page: int, ia_code: str) -> str:
     params = {
         "artistUserName": ARTIST,
         "asc": "u",
@@ -62,41 +69,97 @@ def build_url(page: int, ia_code: str) -> str:
         "page": str(page),
         "iaCode": ia_code,
     }
-    return f"{BASE}?{urlencode(params)}"
+    return f"{RB_BASE}?{urlencode(params)}"
 
-def write_sitemap(urls: list[str]) -> None:
+def xml_escape(s: str) -> str:
+    # wichtig: & muss zu &amp; werden, sonst XML-Fehler
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&apos;")
+    )
+
+def write_redirect_page(path: Path, target_url: str) -> None:
+    # BlogToPin sieht hier eine echte Seite unter /c/<cat>/pXX.html
+    # und kann (je nach Setup) dem Link/Redirect folgen.
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="refresh" content="0; url={target_url}"/>
+  <link rel="canonical" href="{target_url}"/>
+  <title>Redirect</title>
+</head>
+<body>
+  <p>Redirecting to Redbubble…</p>
+  <p><a href="{target_url}">{target_url}</a></p>
+</body>
+</html>
+"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html, encoding="utf-8")
+
+def quota_per_category(categories: int, total: int) -> int:
+    # gleichmäßig verteilen, aufrunden damit wir nah an TOTAL_URLS kommen
+    # Beispiel: 2000/38 => 52.x -> 53
+    return max(1, (total + categories - 1) // categories)
+
+def pick_rotating_pages(ia_code: str, k: int, pool_max: int) -> list[int]:
+    day_seed = int(datetime.now(timezone.utc).strftime("%Y%m%d"))  # täglicher Seed
+    salt = zlib.crc32(ia_code.encode("utf-8")) & 0xFFFFFFFF
+    rnd = random.Random(day_seed ^ salt)
+
+    k = min(k, pool_max)
+    pages = rnd.sample(range(1, pool_max + 1), k=k)
+    pages.sort()
+    return pages
+
+def write_sitemap(locs: list[str]) -> None:
     lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
-    for u in urls:
+    for loc in locs:
         lines.append("  <url>")
-        # Wichtig: & wird beim Schreiben automatisch als &amp; escaped,
-        # weil wir keine Roh-XML-Entities manuell reinpacken, sondern nur Text.
-        lines.append(f"    <loc>{u.replace('&', '&amp;')}</loc>")
+        lines.append(f"    <loc>{xml_escape(loc)}</loc>")
         lines.append(f"    <lastmod>{lastmod}</lastmod>")
         lines.append("  </url>")
     lines.append("</urlset>")
     OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def main() -> None:
-    urls: list[str] = []
-    seen = set()
+    # 1) Alte Redirect-Pages löschen -> damit “alte” wirklich weggehen
+    if C_DIR.exists():
+        shutil.rmtree(C_DIR)
+
+    cats = len(IA_CODES)
+    k = quota_per_category(cats, TOTAL_URLS)
+
+    locs: list[str] = []
 
     for ia in IA_CODES:
-        for p in range(1, PAGES_PER_CATEGORY + 1):
-            u = build_url(p, ia)
-            if u not in seen:
-                seen.add(u)
-                urls.append(u)
+        pages = pick_rotating_pages(ia, k=k, pool_max=POOL_PAGES_PER_CATEGORY)
 
-    # stabil sortieren (BlogToPin mag das oft)
-    urls_sorted = sorted(urls)
+        for p in pages:
+            # GitHub-Pages URL (damit BlogToPin Kategorien sieht)
+            local_rel = Path("c") / ia / f"p{p}.html"
+            local_url = f"{SITE_BASE}/{local_rel.as_posix()}"
 
-    write_sitemap(urls_sorted)
-    OUT_COUNT.write_text(str(len(urls_sorted)) + "\n", encoding="utf-8")
-    print(f"✅ OK: wrote {len(urls_sorted)} URLs | categories={len(set(IA_CODES))} | pages_per_category={PAGES_PER_CATEGORY}")
+            # Redbubble Ziel
+            target = rb_url(p, ia)
+
+            # Redirect-Seite schreiben
+            write_redirect_page(local_rel, target)
+
+            locs.append(local_url)
+
+    locs.sort()
+    write_sitemap(locs)
+    OUT_COUNT.write_text(str(len(locs)) + "\n", encoding="utf-8")
+    print(f"✅ OK: wrote {len(locs)} URLs | categories={cats} | per_category={k}")
 
 if __name__ == "__main__":
     main()
