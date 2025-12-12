@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
-import html
 
-# =========================
-# CONFIG
-# =========================
+OUT_SITEMAP = Path("sitemap.xml")
+OUT_COUNT = Path("last_count.txt")
 
 ARTIST = "WearWink"
-BASE_SHOP = f"https://www.redbubble.com/people/{ARTIST}/shop"
+BASE = f"https://www.redbubble.com/people/{ARTIST}/shop"
 
+# Deine Produktkategorien (iaCode) – bitte hier pflegen
 IA_CODES = [
     "w-dresses",
     "u-sweatshirts",
@@ -53,91 +52,51 @@ IA_CODES = [
     "u-bag-studiopouch",
 ]
 
-MAX_TOTAL_URLS = 2000
-PAGES_PER_CATEGORY_POOL = 200  # “Rotation-Range” pro Kategorie
+PAGES_PER_CATEGORY = 53  # “immer 53 Seiten”
 
-ASC = "u"
-SORT_ORDER = "recent"
-
-OUT_SITEMAP_XML = Path("sitemap.xml")
-OUT_COUNT = Path("last_count.txt")
-
-
-# =========================
-# HELPERS
-# =========================
-
-def build_listing_url(page: int, ia_code: str) -> str:
+def build_url(page: int, ia_code: str) -> str:
     params = {
         "artistUserName": ARTIST,
-        "asc": ASC,
-        "sortOrder": SORT_ORDER,
+        "asc": "u",
+        "sortOrder": "recent",
         "page": str(page),
         "iaCode": ia_code,
     }
-    return f"{BASE_SHOP}?{urlencode(params)}"
+    return f"{BASE}?{urlencode(params)}"
 
-
-def daily_rotating_pages(pool_size: int, take: int, seed: int) -> list[int]:
-    if pool_size <= 0 or take <= 0:
-        return []
-    start = seed % pool_size
-    return [((start + i) % pool_size) + 1 for i in range(take)]
-
-
-def compute_daily_quotas(total: int, n_categories: int, day_seed: int) -> list[int]:
-    base = total // n_categories
-    rem = total % n_categories
-    quotas = [base] * n_categories
-    start = day_seed % n_categories
-    for i in range(rem):
-        quotas[(start + i) % n_categories] += 1
-    return quotas
-
-
-def write_sitemap_xml(urls: list[str]) -> None:
+def write_sitemap(urls: list[str]) -> None:
     lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
     for u in urls:
-        # WICHTIG: XML-escape, sonst ist & ein XML-Fehler!
-        loc = html.escape(u, quote=True)
         lines.append("  <url>")
-        lines.append(f"    <loc>{loc}</loc>")
+        # Wichtig: & wird beim Schreiben automatisch als &amp; escaped,
+        # weil wir keine Roh-XML-Entities manuell reinpacken, sondern nur Text.
+        lines.append(f"    <loc>{u.replace('&', '&amp;')}</loc>")
         lines.append(f"    <lastmod>{lastmod}</lastmod>")
         lines.append("  </url>")
     lines.append("</urlset>")
-    OUT_SITEMAP_XML.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
+    OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def main() -> None:
-    n = len(IA_CODES)
-    if n == 0:
-        print("❌ IA_CODES ist leer.")
-        return
-
-    day_seed = date.today().toordinal()
-    quotas = compute_daily_quotas(MAX_TOTAL_URLS, n, day_seed)
-
     urls: list[str] = []
-    for idx, ia in enumerate(IA_CODES):
-        take = quotas[idx]
-        seed = day_seed + idx * 97
-        pages = daily_rotating_pages(PAGES_PER_CATEGORY_POOL, take, seed)
-        for p in pages:
-            urls.append(build_listing_url(p, ia))
+    seen = set()
 
-    # dedupe + Reihenfolge behalten
-    urls = list(dict.fromkeys(urls))
+    for ia in IA_CODES:
+        for p in range(1, PAGES_PER_CATEGORY + 1):
+            u = build_url(p, ia)
+            if u not in seen:
+                seen.add(u)
+                urls.append(u)
 
-    write_sitemap_xml(urls)
-    OUT_COUNT.write_text(str(len(urls)) + "\n", encoding="utf-8")
+    # stabil sortieren (BlogToPin mag das oft)
+    urls_sorted = sorted(urls)
 
-    print(f"✅ OK: wrote {len(urls)} URLs")
-    print(f"   categories: {n} | pool per category: {PAGES_PER_CATEGORY_POOL}")
-
+    write_sitemap(urls_sorted)
+    OUT_COUNT.write_text(str(len(urls_sorted)) + "\n", encoding="utf-8")
+    print(f"✅ OK: wrote {len(urls_sorted)} URLs | categories={len(set(IA_CODES))} | pages_per_category={PAGES_PER_CATEGORY}")
 
 if __name__ == "__main__":
     main()
