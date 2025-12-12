@@ -30,7 +30,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sitemap.xml urls.txt last_count.txt index.html || true
+          git add sitemap.xml last_count.txt index.html c/ || true
           git diff --cached --quiet || git commit -m "Update sitemap"
           git push
 
