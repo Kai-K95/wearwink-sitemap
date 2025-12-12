@@ -57,6 +57,7 @@ IA_CODES = [
 OUT_SITEMAP = Path("sitemap.xml")
 OUT_COUNT = Path("last_count.txt")
 OUT_INDEX = Path("index.html")
+OUT_URLS = Path("urls.txt")
 PAGES_DIR = Path("c")  # -> /c/<iaCode>/index.html
 
 
@@ -64,7 +65,7 @@ def rb_category_url(ia_code: str) -> str:
     params = {
         "artistUserName": USERNAME,
         "asc": ASC,
-        "page": 1,  # nur Kategorie-Seed
+        "page": 1,
         "sortOrder": SORT,
         "iaCode": ia_code,
     }
@@ -72,7 +73,6 @@ def rb_category_url(ia_code: str) -> str:
 
 
 def local_category_url(ia_code: str) -> str:
-    # Wichtig: BlogToPin bekommt nur DEINE Domain in der Sitemap
     return f"{SITE_BASE}/c/{ia_code}/"
 
 
@@ -95,17 +95,19 @@ def write_redirect_page(path: Path, target: str, title: str) -> None:
     path.write_text(html, encoding="utf-8")
 
 
-def write_sitemap(urls: list[str]) -> None:
+def write_sitemap(local_urls: list[str]) -> None:
+    # HARTER SCHUTZ: sitemap darf NIE redbubble enthalten
+    if any("redbubble.com" in u for u in local_urls):
+        raise RuntimeError("BUG: sitemap list contains redbubble URLs. It must be ONLY your GitHub Pages URLs.")
+
     lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
-    for u in urls:
-        # local URLs haben keine &, trotzdem safe:
-        u_xml = u.replace("&", "&amp;")
+    for u in local_urls:
         lines.append("  <url>")
-        lines.append(f"    <loc>{u_xml}</loc>")
+        lines.append(f"    <loc>{u}</loc>")
         lines.append(f"    <lastmod>{lastmod}</lastmod>")
         lines.append("  </url>")
     lines.append("</urlset>")
@@ -113,31 +115,44 @@ def write_sitemap(urls: list[str]) -> None:
 
 
 def main():
-    # alte Redirect-Seiten entfernen
+    # Komplett aufräumen, damit NICHTS “drin bleibt”
     if PAGES_DIR.exists():
         shutil.rmtree(PAGES_DIR)
 
-    urls = []
+    for f in [OUT_SITEMAP, OUT_COUNT, OUT_INDEX, OUT_URLS]:
+        if f.exists():
+            f.unlink()
+
+    local_urls: list[str] = []
+
     for ia in IA_CODES:
         target = rb_category_url(ia)
         out_dir = PAGES_DIR / ia
         out_dir.mkdir(parents=True, exist_ok=True)
         write_redirect_page(out_dir / "index.html", target, title=f"{ia} category")
-        urls.append(local_category_url(ia))
+        local_urls.append(local_category_url(ia))
 
-    urls = sorted(set(urls))
-    write_sitemap(urls)
-    OUT_COUNT.write_text(str(len(urls)) + "\n", encoding="utf-8")
+    local_urls = sorted(set(local_urls))
+
+    # Outputs
+    OUT_URLS.write_text("\n".join(local_urls) + "\n", encoding="utf-8")
+    OUT_COUNT.write_text(str(len(local_urls)) + "\n", encoding="utf-8")
+    write_sitemap(local_urls)
 
     OUT_INDEX.write_text(
         "<!doctype html><meta charset='utf-8'>"
         "<h1>WearWink Category Seeds</h1>"
-        f"<p>Count: <b>{len(urls)}</b></p>"
-        "<p><a href='sitemap.xml'>sitemap.xml</a> | <a href='last_count.txt'>last_count.txt</a></p>",
+        f"<p>Count: <b>{len(local_urls)}</b></p>"
+        "<ul>"
+        "<li><a href='sitemap.xml'>sitemap.xml</a></li>"
+        "<li><a href='urls.txt'>urls.txt</a></li>"
+        "<li><a href='last_count.txt'>last_count.txt</a></li>"
+        "</ul>",
         encoding="utf-8",
     )
 
-    print(f"✅ OK: wrote {len(urls)} category redirect pages")
+    print(f"✅ OK: wrote {len(local_urls)} category seed URLs (LOCAL ONLY)")
+    print("First 3:", local_urls[:3])
 
 
 if __name__ == "__main__":
