@@ -32,7 +32,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # wichtig: diese Dateien müssen mit committed werden
-          git add sitemap.xml sitemap.txt last_count.txt pool_urls.txt used_urls.txt || true
+          git add sitemap.xml sitemap.txt last_count.txt pool_by_category.json used_by_category.json || true
 
           git diff --cached --quiet || git commit -m "Update sitemap"
           git push
