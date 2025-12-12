@@ -1,136 +1,85 @@
-import os
-import re
-import sys
-import time
-import random
-import datetime
+from __future__ import annotations
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Set, Tuple, Optional
-
-import requests
-from bs4 import BeautifulSoup
+from urllib.parse import urlencode
+import random
 
 # =========================
 # CONFIG
 # =========================
-ARTIST = "WearWink"
-BASE = "https://www.redbubble.com"  # bewusst OHNE /de/
+BASE = "https://www.redbubble.com"
+USERNAME = "WearWink"  # wichtig: genau so wie dein Account heißt
 
-# Quelle für Design-IDs (liefert /shop/ap/<id>)
-EXPLORE_URL_TEMPLATE = BASE + f"/people/{ARTIST}/explore?asc=u&page={{page}}&sortOrder=recent"
+# Deine neue Filter-URL entspricht im Kern:
+# /people/WearWink/shop?artistUserName=WearWink&asc=u&iaCode=u-clothing
+# -> Wir generieren daraus viele Seiten (page=1..N) und rotieren.
 
-# Aus jedem Design (/shop/ap/<id>) holen wir ALLE Produktlinks (/i/<type>/.../<id>.<code>)
-DESIGN_PAGE_TEMPLATE = BASE + "/shop/ap/{id}"
+IA_CODES = [
+    "u-clothing",   # Kleidung (dein Beispiel)
+    # Wenn du später mehr willst, einfach ergänzen, z.B.:
+    # "u-stationery", "u-home", "u-accessories" ...
+]
 
-# Sicherheitslimits (damit GitHub Actions nicht ewig läuft)
-MAX_EXPLORE_PAGES = 25        # reicht meist; bei Bedarf höher
-MAX_DESIGNS = 0               # 0 = alle gefundenen; sonst z.B. 200
-SLEEP_BETWEEN_REQUESTS = 0.8  # höflich + weniger Block-Risiko
+SORT = "recent"       # "recent" oder "bestselling"
+ASC = "u"
 
-# Rotation/Limits für BlogToPin
-ENABLE_ROTATION = True
-ROTATION_MODE = "daily_random"     # "off" | "daily_random" | "newest_only"
-MAX_URLS_IN_SITEMAP = 2500         # 0 = keine Begrenzung
+# Wie groß ist der Pool, aus dem wir ziehen?
+# Je größer, desto länger ohne Wiederholung.
+PAGES_PER_IACODE_POOL = 500   # z.B. 500 Seiten pro Kategorie im Pool
+
+# Wie viele Links soll die Sitemap pro Run enthalten?
+MAX_URLS_PER_RUN = 2000
+
+# Rotation: täglich stabiler Shuffle, aber OHNE Wiederholung über Runs (State Datei)
+DAILY_STABLE_SHUFFLE = True
 
 # Output
 OUT_SITEMAP = Path("sitemap.xml")
 OUT_URLS = Path("urls.txt")
 OUT_COUNT = Path("last_count.txt")
-OUT_DESIGNS = Path("design_ids.txt")
-
-# =========================
-# HTTP
-# =========================
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
-
-def is_cloudflare_challenge(html: str) -> bool:
-    h = html.lower()
-    return (
-        "confirm you are human" in h
-        or "cloudflare" in h and "verify" in h
-        or "checking your browser" in h
-        or "attention required" in h
-    )
-
-
-def fetch(url: str, retries: int = 3, timeout: int = 30) -> Optional[str]:
-    for attempt in range(1, retries + 1):
-        try:
-            r = SESSION.get(url, timeout=timeout, allow_redirects=True)
-            if r.status_code >= 400:
-                # 403/429 sind typisch bei Bot-Block; wir versuchen Retry
-                time.sleep(1.5 * attempt)
-                continue
-            text = r.text or ""
-            if is_cloudflare_challenge(text):
-                return None
-            return text
-        except Exception:
-            time.sleep(1.5 * attempt)
-    return None
+STATE_USED = Path("used_urls.txt")  # merkt sich "verwendete" URLs
+OUT_INDEX = Path("index.html")
 
 
 # =========================
-# PARSING
+# URL Builder
 # =========================
-DESIGN_ID_RE = re.compile(r"/shop/ap/(\d+)")
-PRODUCT_URL_RE = re.compile(r"^https?://www\.redbubble\.com/(?:de/)?i/[^/]+/.+/\d+\.[A-Z0-9]+", re.IGNORECASE)
+def build_shop_url(page: int, ia_code: str | None) -> str:
+    params = {
+        "artistUserName": USERNAME,
+        "asc": ASC,
+        "page": page,
+        "sortOrder": SORT,
+    }
+    if ia_code:
+        params["iaCode"] = ia_code
+
+    q = urlencode(params)
+    # canonical Pfad mit korrekter Groß-/Kleinschreibung:
+    return f"{BASE}/people/{USERNAME}/shop?{q}"
 
 
-def normalize_url(u: str) -> str:
-    # Entfernt /de/ falls vorhanden
-    u = u.replace("https://www.redbubble.com/de/", "https://www.redbubble.com/")
-    u = u.replace("http://www.redbubble.com/de/", "https://www.redbubble.com/")
-    u = u.replace("http://www.redbubble.com/", "https://www.redbubble.com/")
-    return u
+def generate_pool() -> list[str]:
+    pool: list[str] = []
 
+    # optional: einmal "ohne iaCode" (alles gemischt)
+    # pool += [build_shop_url(p, None) for p in range(1, PAGES_PER_IACODE_POOL + 1)]
 
-def extract_design_ids_from_explore(html: str) -> List[str]:
-    # /shop/ap/<id> kommt im HTML vor
-    ids = DESIGN_ID_RE.findall(html)
-    # dedupe, aber Reihenfolge behalten (newest-first ist hilfreich)
-    seen = set()
-    out = []
-    for i in ids:
-        if i not in seen:
-            seen.add(i)
-            out.append(i)
-    return out
+    # mit iaCodes
+    for ia in IA_CODES:
+        for p in range(1, PAGES_PER_IACODE_POOL + 1):
+            pool.append(build_shop_url(p, ia))
 
-
-def extract_product_urls_from_design(html: str) -> Set[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    urls: Set[str] = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.startswith("/"):
-            href = BASE + href
-        href = normalize_url(href)
-
-        if PRODUCT_URL_RE.match(href):
-            urls.add(href)
-
-    return urls
+    # dedupe
+    pool = sorted(set(pool))
+    return pool
 
 
 # =========================
-# SITEMAP
+# Sitemap writers
 # =========================
-def write_sitemap(urls: List[str]) -> None:
-    # simples XML; reicht für BlogToPin + Tools
+def write_sitemap(urls: list[str]) -> None:
+    lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
@@ -138,123 +87,90 @@ def write_sitemap(urls: List[str]) -> None:
     for u in urls:
         lines.append("  <url>")
         lines.append(f"    <loc>{u}</loc>")
+        lines.append(f"    <lastmod>{lastmod}</lastmod>")
         lines.append("  </url>")
     lines.append("</urlset>")
     OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def stable_daily_sample(urls: List[str], k: int) -> List[str]:
-    if k <= 0 or k >= len(urls):
-        return urls
-    # stabil pro Tag, damit es nicht bei jedem Run komplett anders ist
-    seed = int(datetime.datetime.utcnow().strftime("%Y%m%d"))
-    rng = random.Random(seed)
-    return rng.sample(urls, k)
+def write_index(count: int) -> None:
+    OUT_INDEX.write_text(
+        f"""<!doctype html><meta charset="utf-8">
+<title>WearWink Sitemap</title>
+<h1>WearWink Sitemap</h1>
+<p>URLs in Sitemap: <b>{count}</b></p>
+<ul>
+<li><a href="sitemap.xml">sitemap.xml</a></li>
+<li><a href="urls.txt">urls.txt</a></li>
+<li><a href="last_count.txt">last_count.txt</a></li>
+<li><a href="used_urls.txt">used_urls.txt</a></li>
+</ul>
+""",
+        encoding="utf-8",
+    )
 
 
 # =========================
-# MAIN
+# State (used urls)
 # =========================
-def load_previous_design_ids() -> List[str]:
-    if OUT_DESIGNS.exists():
-        return [x.strip() for x in OUT_DESIGNS.read_text(encoding="utf-8").splitlines() if x.strip().isdigit()]
-    return []
+def load_used() -> set[str]:
+    if not STATE_USED.exists():
+        return set()
+    return {line.strip() for line in STATE_USED.read_text(encoding="utf-8").splitlines() if line.strip()}
 
 
-def save_design_ids(ids: List[str]) -> None:
-    OUT_DESIGNS.write_text("\n".join(ids) + "\n", encoding="utf-8")
+def save_used(used: set[str]) -> None:
+    STATE_USED.write_text("\n".join(sorted(used)) + "\n", encoding="utf-8")
 
 
-def main() -> int:
-    all_design_ids: List[str] = []
-    total_new = 0
+# =========================
+# Main selection logic
+# =========================
+def pick_urls(pool: list[str], used: set[str]) -> tuple[list[str], set[str], bool]:
+    remaining = [u for u in pool if u not in used]
 
-    print("== Collecting design IDs from Explore ==")
-    for page in range(1, MAX_EXPLORE_PAGES + 1):
-        url = EXPLORE_URL_TEMPLATE.format(page=page)
-        html = fetch(url)
-        if not html:
-            print(f"explore page {page}: BLOCKED/EMPTY")
-            break
+    # Shuffle (täglich stabil oder komplett random)
+    if DAILY_STABLE_SHUFFLE:
+        seed = int(datetime.utcnow().strftime("%Y%m%d"))
+        rng = random.Random(seed)
+        rng.shuffle(remaining)
+    else:
+        random.shuffle(remaining)
 
-        ids = extract_design_ids_from_explore(html)
-        if not ids:
-            print(f"explore page {page}: +0 designs (total {len(all_design_ids)})")
-            break
-
-        before = len(all_design_ids)
-        for i in ids:
-            if i not in all_design_ids:
-                all_design_ids.append(i)
-        total_new = len(all_design_ids) - before
-        print(f"explore page {page}: +{total_new} designs (total {len(all_design_ids)})")
-
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-        # Wenn die Seite nichts neues bringt, abbrechen
-        if total_new == 0:
-            break
-
-    # Fallback: wenn RB blockt, nimm die letzte bekannte Liste
-    if len(all_design_ids) == 0:
-        prev = load_previous_design_ids()
-        if prev:
-            print(f"⚠️ Explore blocked. Using cached design_ids.txt ({len(prev)} IDs).")
-            all_design_ids = prev
+    # Wenn nicht genug übrig ist: reset (sonst könntest du nie wieder 2000 ohne Wiederholung liefern)
+    did_reset = False
+    if len(remaining) < MAX_URLS_PER_RUN:
+        used.clear()
+        did_reset = True
+        remaining = pool[:]  # alles wieder verfügbar
+        if DAILY_STABLE_SHUFFLE:
+            seed = int(datetime.utcnow().strftime("%Y%m%d"))
+            rng = random.Random(seed)
+            rng.shuffle(remaining)
         else:
-            print("❌ No design IDs found and no cache available. Not updating outputs.")
-            return 0
+            random.shuffle(remaining)
 
-    # ggf. limit Designs
-    if MAX_DESIGNS and MAX_DESIGNS > 0:
-        all_design_ids = all_design_ids[:MAX_DESIGNS]
+    chosen = remaining[:MAX_URLS_PER_RUN]
+    used.update(chosen)
+    return sorted(set(chosen)), used, did_reset
 
-    # speichern (Cache)
-    save_design_ids(all_design_ids)
 
-    print(f"\n== Fetching product URLs from {len(all_design_ids)} design pages ==")
-    all_product_urls: Set[str] = set()
+def main():
+    pool = generate_pool()
+    used = load_used()
 
-    for idx, did in enumerate(all_design_ids, start=1):
-        durl = DESIGN_PAGE_TEMPLATE.format(id=did)
-        html = fetch(durl)
-        if not html:
-            print(f"[{idx}/{len(all_design_ids)}] design {did}: BLOCKED/EMPTY")
-            continue
+    urls, used, did_reset = pick_urls(pool, used)
 
-        urls = extract_product_urls_from_design(html)
-        all_product_urls.update(urls)
-        print(f"[{idx}/{len(all_design_ids)}] design {did}: +{len(urls)} products (total {len(all_product_urls)})")
+    OUT_URLS.write_text("\n".join(urls) + "\n", encoding="utf-8")
+    OUT_COUNT.write_text(str(len(urls)) + "\n", encoding="utf-8")
+    save_used(used)
+    write_sitemap(urls)
+    write_index(len(urls))
 
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-    urls_sorted = sorted(all_product_urls)
-
-    # Wenn 0 (z.B. plötzlich block), NICHT überschreiben (damit last_count nicht 0 wird)
-    if len(urls_sorted) == 0:
-        print("⚠️ Collected 0 product URLs. Keeping existing sitemap/last_count unchanged.")
-        return 0
-
-    # Rotation / Limit
-    if MAX_URLS_IN_SITEMAP and MAX_URLS_IN_SITEMAP > 0:
-        if ENABLE_ROTATION and ROTATION_MODE == "daily_random":
-            urls_sorted = stable_daily_sample(urls_sorted, MAX_URLS_IN_SITEMAP)
-        elif ENABLE_ROTATION and ROTATION_MODE == "newest_only":
-            # newest_only ist schwierig ohne Metadaten; wir nehmen einfach die ersten N der sortierten Liste nicht.
-            # -> daher: keine besondere Logik, nimm die ersten N (stabil).
-            urls_sorted = urls_sorted[:MAX_URLS_IN_SITEMAP]
-        else:
-            urls_sorted = urls_sorted[:MAX_URLS_IN_SITEMAP]
-
-    urls_sorted = sorted(urls_sorted)
-
-    write_sitemap(urls_sorted)
-    OUT_URLS.write_text("\n".join(urls_sorted) + "\n", encoding="utf-8")
-    OUT_COUNT.write_text(str(len(urls_sorted)) + "\n", encoding="utf-8")
-
-    print(f"\n✅ OK: {len(urls_sorted)} product URLs written.")
-    return 0
+    print(f"✅ OK: {len(urls)} URLs in sitemap (pool={len(pool)}, used={len(used)})")
+    if did_reset:
+        print("♻️ Pool was exhausted -> used_urls.txt RESET (starting fresh).")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
