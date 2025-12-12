@@ -3,7 +3,7 @@ name: Update sitemap
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"  # täglich 03:00 UTC
+    - cron: "0 3 * * *"
 
 permissions:
   contents: write
@@ -11,12 +11,11 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -28,13 +27,12 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Generate sitemap
-        run: |
-          python generate_sitemap.py
+        run: python generate_sitemap.py
 
-      - name: Commit changes (if any)
+      - name: Commit changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sitemap.xml index.html
+          git add sitemap.xml last_count.txt
           git diff --cached --quiet || git commit -m "Update sitemap"
           git push
