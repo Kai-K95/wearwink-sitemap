@@ -1,50 +1,38 @@
-import os
-import re
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse, parse_qsl, urlencode
-
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
+from urllib.parse import urlencode
 
 # =========================
-# CONFIG (optional via ENV)
+# CONFIG
 # =========================
-RB_USER = os.getenv("RB_USER", "WearWink")
-BASE_DOMAIN = "https://www.redbubble.com"
+USERNAME = "WearWink"
+LOCALE = "de"  # "de" für /de/ URLs; wenn du lieber ohne Locale willst, setz LOCALE = ""
+MAX_SHOP_PAGES = 250     # 250 * ~60 Tiles ≈ sehr viel Abdeckung
+MAX_EXPLORE_PAGES = 50   # Explore Designs Seiten
+SHOP_SORT = "bestselling"  # "bestselling" oder "recent"
+EXPLORE_SORT = "recent"    # meist "recent"
 
-EXPLORE_BASE = os.getenv(
-    "EXPLORE_URL",
-    f"{BASE_DOMAIN}/de/people/{RB_USER}/explore?asc=u&sortOrder=recent&page=1",
-)
-
-MAX_EXPLORE_PAGES = int(os.getenv("MAX_EXPLORE_PAGES", "30"))
-MAX_DESIGNS_TO_EXPAND = int(os.getenv("MAX_DESIGNS_TO_EXPAND", "200"))
-
-SCROLL_ROUNDS_EXPLORE = int(os.getenv("SCROLL_ROUNDS_EXPLORE", "8"))
-SCROLL_ROUNDS_AP = int(os.getenv("SCROLL_ROUNDS_AP", "12"))
-SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "900"))
-WAIT_FIRST_MS = int(os.getenv("WAIT_FIRST_MS", "2200"))
-
+# Dateien im Repo
 OUT_SITEMAP = Path("sitemap.xml")
-OUT_COUNT = Path("last_count.txt")
 OUT_URLS = Path("urls.txt")
+OUT_COUNT = Path("last_count.txt")
+OUT_INDEX = Path("index.html")
 
-DEBUG_EXPLORE_HTML = Path("debug_explore_p1.html")
-DEBUG_EXPLORE_PNG = Path("debug_explore_p1.png")
-DEBUG_AP1_HTML = Path("debug_ap1.html")
-DEBUG_AP1_PNG = Path("debug_ap1.png")
+# =========================
+# HELPERS
+# =========================
+def base() -> str:
+    # https://www.redbubble.com/de/... oder ohne /de/
+    if LOCALE:
+        return f"https://www.redbubble.com/{LOCALE}"
+    return "https://www.redbubble.com"
 
-
-def normalize_url(u: str) -> str | None:
-    if not u or not isinstance(u, str):
-        return None
-    if not u.startswith("http"):
-        return None
-    if "redbubble.com" not in u:
-        return None
-    return u.split("#", 1)[0].split("?", 1)[0]
-
+def build_people_url(path: str, params: dict) -> str:
+    # path z.B. "/people/WearWink/shop"
+    qs = urlencode(params, doseq=True)
+    return f"{base()}{path}?{qs}"
 
 def write_sitemap(urls: list[str]) -> None:
     lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -60,178 +48,74 @@ def write_sitemap(urls: list[str]) -> None:
     lines.append("</urlset>")
     OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+def write_index(urls_count: int) -> None:
+    # damit GitHub Pages nicht 404 auf / zeigt
+    sitemap_link = "sitemap.xml"
+    urls_link = "urls.txt"
+    OUT_INDEX.write_text(
+        f"""<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WearWink Sitemap</title>
+  <style>
+    body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;}}
+    code{{background:#f2f2f2;padding:2px 6px;border-radius:6px;}}
+  </style>
+</head>
+<body>
+  <h1>WearWink Sitemap</h1>
+  <p>Letztes Update: <code>{datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}</code></p>
+  <p>URLs in Sitemap: <code>{urls_count}</code></p>
+  <ul>
+    <li><a href="{sitemap_link}">{sitemap_link}</a></li>
+    <li><a href="{urls_link}">{urls_link}</a></li>
+  </ul>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
 
-def try_accept_cookies(page) -> None:
-    patterns = [
-        r"(accept|agree|i agree|allow all)",
-        r"(zustimmen|akzeptieren|alle akzeptieren|einverstanden)",
-    ]
-    for pat in patterns:
-        try:
-            page.get_by_role("button", name=re.compile(pat, re.I)).click(timeout=2500)
-            break
-        except Exception:
-            pass
+# =========================
+# MAIN
+# =========================
+def main() -> None:
+    urls: list[str] = []
 
+    # Basis-Seiten
+    urls.append(build_people_url(f"/people/{USERNAME}/shop", {"asc": "u", "sortOrder": SHOP_SORT}))
+    urls.append(build_people_url(f"/people/{USERNAME}/explore", {"asc": "u", "sortOrder": EXPLORE_SORT}))
 
-def scroll_page(page, rounds: int) -> None:
-    last_h = 0
-    stable = 0
-    for _ in range(rounds):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(SCROLL_PAUSE_MS)
-        h = page.evaluate("document.body.scrollHeight")
-        if h == last_h:
-            stable += 1
-        else:
-            stable = 0
-            last_h = h
-        if stable >= 2:
-            break
-
-
-def explore_page_url(base: str, page_no: int) -> str:
-    u = urlparse(base)
-    q = dict(parse_qsl(u.query))
-    q["page"] = str(page_no)
-    return u._replace(query=urlencode(q)).geturl()
-
-
-def collect_ap_links_from_dom(page) -> set[str]:
-    hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-    out = set()
-    for h in hrefs:
-        h = normalize_url(h)
-        if h and "/shop/ap/" in h:
-            out.add(h)
-    return out
-
-
-def extract_product_urls_from_html(html: str) -> set[str]:
-    """
-    Robuste Extraktion von /de/i/... Links aus dem gerenderten HTML,
-    auch wenn sie nicht als <a href> im DOM auftauchen.
-    """
-    out: set[str] = set()
-
-    # 1) Vollständige URLs
-    for m in re.findall(r"https?://www\.redbubble\.com/de/i/[^\s\"'<>\\]+", html):
-        out.add(normalize_url(m) or m)
-
-    # 2) Relative Pfade (auch escaped \/de\/i\/...)
-    # unescaped
-    for m in re.findall(r"(/de/i/[^\s\"'<>\\]+)", html):
-        out.add(normalize_url(BASE_DOMAIN + m) or (BASE_DOMAIN + m))
-
-    # escaped
-    for m in re.findall(r"(\\/de\\/i\\/[^\s\"'<>\\]+)", html):
-        m2 = m.replace("\\/", "/")
-        out.add(normalize_url(BASE_DOMAIN + m2) or (BASE_DOMAIN + m2))
-
-    return out
-
-
-def main():
-    ap_urls: set[str] = set()
-    product_urls: set[str] = set()
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
+    # Shop-Pagination (Mockup-Produktkacheln!)
+    for page in range(1, MAX_SHOP_PAGES + 1):
+        urls.append(
+            build_people_url(
+                f"/people/{USERNAME}/shop",
+                {"asc": "u", "page": page, "sortOrder": SHOP_SORT},
+            )
         )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0.0.0 Safari/537.36"
-            ),
-            locale="de-DE",
-            viewport={"width": 1400, "height": 900},
+
+    # Explore-Pagination (Design-Feed)
+    for page in range(1, MAX_EXPLORE_PAGES + 1):
+        urls.append(
+            build_people_url(
+                f"/people/{USERNAME}/explore",
+                {"asc": "u", "page": page, "sortOrder": EXPLORE_SORT},
+            )
         )
-        context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-        page = context.new_page()
 
-        # =========================
-        # 1) EXPLORE: /shop/ap/ sammeln
-        # =========================
-        no_add_pages = 0
-        for pno in range(1, MAX_EXPLORE_PAGES + 1):
-            url = explore_page_url(EXPLORE_BASE, pno)
-            page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-            page.wait_for_timeout(WAIT_FIRST_MS)
-            try_accept_cookies(page)
+    # Dedupe + stabil sort
+    urls = sorted(set(urls))
 
-            # etwas scrollen, falls lazy-load
-            try:
-                page.wait_for_selector('a[href*="/shop/ap/"]', timeout=10_000)
-            except PWTimeout:
-                pass
-            scroll_page(page, SCROLL_ROUNDS_EXPLORE)
+    # Outputs
+    OUT_URLS.write_text("\n".join(urls) + "\n", encoding="utf-8")
+    write_sitemap(urls)
+    OUT_COUNT.write_text(str(len(urls)) + "\n", encoding="utf-8")
+    write_index(len(urls))
 
-            if pno == 1:
-                DEBUG_EXPLORE_HTML.write_text(page.content(), encoding="utf-8")
-                try:
-                    page.screenshot(path=str(DEBUG_EXPLORE_PNG), full_page=True)
-                except Exception:
-                    pass
-
-            before = len(ap_urls)
-            ap_urls |= collect_ap_links_from_dom(page)
-            added = len(ap_urls) - before
-            print(f"explore page {pno}: +{added} designs (total {len(ap_urls)})")
-
-            if added == 0:
-                no_add_pages += 1
-            else:
-                no_add_pages = 0
-
-            if pno >= 2 and no_add_pages >= 2:
-                break
-
-        print(f"✅ designs collected: {len(ap_urls)}")
-
-        # =========================
-        # 2) pro /shop/ap/: Produktlinks (/de/i/...) extrahieren
-        # =========================
-        ap_list = sorted(ap_urls)[:MAX_DESIGNS_TO_EXPAND]
-
-        for idx, ap in enumerate(ap_list, start=1):
-            page.goto(ap, wait_until="domcontentloaded", timeout=90_000)
-            page.wait_for_timeout(WAIT_FIRST_MS)
-            try_accept_cookies(page)
-
-            # scroll, damit mehr Produkte gerendert werden
-            scroll_page(page, SCROLL_ROUNDS_AP)
-
-            html = page.content()
-            found = extract_product_urls_from_html(html)
-
-            before = len(product_urls)
-            product_urls |= found
-            added = len(product_urls) - before
-
-            if idx == 1:
-                DEBUG_AP1_HTML.write_text(html, encoding="utf-8")
-                try:
-                    page.screenshot(path=str(DEBUG_AP1_PNG), full_page=True)
-                except Exception:
-                    pass
-
-            if idx % 10 == 0 or added > 0:
-                print(f"design {idx}/{len(ap_list)}: +{added} product URLs (total {len(product_urls)})")
-
-        context.close()
-        browser.close()
-
-    urls_sorted = sorted(product_urls)
-
-    write_sitemap(urls_sorted)
-    OUT_URLS.write_text("\n".join(urls_sorted) + ("\n" if urls_sorted else ""), encoding="utf-8")
-    OUT_COUNT.write_text(str(len(urls_sorted)) + "\n", encoding="utf-8")
-
-    print(f"✅ OK: {len(urls_sorted)} product URLs | designs_seen={len(ap_urls)}")
-
+    print(f"✅ OK: {len(urls)} URLs geschrieben (shop_pages={MAX_SHOP_PAGES}, explore_pages={MAX_EXPLORE_PAGES})")
 
 if __name__ == "__main__":
     main()
