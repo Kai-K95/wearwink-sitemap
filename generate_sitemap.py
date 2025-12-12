@@ -10,22 +10,21 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # =========================
 # CONFIG (optional via ENV)
 # =========================
-RB_USER = os.getenv("RB_USER", "WearWink")  # Groß/Klein egal bei URL
+RB_USER = os.getenv("RB_USER", "WearWink")
+BASE_DOMAIN = "https://www.redbubble.com"
 
-# Start ist jetzt EXPLIZIT "Designs entdecken"
 EXPLORE_BASE = os.getenv(
     "EXPLORE_URL",
-    f"https://www.redbubble.com/de/people/{RB_USER}/explore?asc=u&sortOrder=recent&page=1",
+    f"{BASE_DOMAIN}/de/people/{RB_USER}/explore?asc=u&sortOrder=recent&page=1",
 )
 
-MAX_EXPLORE_PAGES = int(os.getenv("MAX_EXPLORE_PAGES", "30"))           # wie viele explore Seiten prüfen
-SCROLL_ROUNDS_EXPLORE = int(os.getenv("SCROLL_ROUNDS_EXPLORE", "12"))
-SCROLL_ROUNDS_AP = int(os.getenv("SCROLL_ROUNDS_AP", "10"))
+MAX_EXPLORE_PAGES = int(os.getenv("MAX_EXPLORE_PAGES", "30"))
+MAX_DESIGNS_TO_EXPAND = int(os.getenv("MAX_DESIGNS_TO_EXPAND", "200"))
+
+SCROLL_ROUNDS_EXPLORE = int(os.getenv("SCROLL_ROUNDS_EXPLORE", "8"))
+SCROLL_ROUNDS_AP = int(os.getenv("SCROLL_ROUNDS_AP", "12"))
 SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "900"))
 WAIT_FIRST_MS = int(os.getenv("WAIT_FIRST_MS", "2200"))
-
-MAX_DESIGNS_TO_EXPAND = int(os.getenv("MAX_DESIGNS_TO_EXPAND", "200"))  # wie viele /shop/ap/ öffnen
-MAX_PRODUCTS_PER_DESIGN = int(os.getenv("MAX_PRODUCTS_PER_DESIGN", "300"))
 
 OUT_SITEMAP = Path("sitemap.xml")
 OUT_COUNT = Path("last_count.txt")
@@ -98,7 +97,7 @@ def explore_page_url(base: str, page_no: int) -> str:
     return u._replace(query=urlencode(q)).geturl()
 
 
-def collect_ap_links(page) -> set[str]:
+def collect_ap_links_from_dom(page) -> set[str]:
     hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
     out = set()
     for h in hrefs:
@@ -108,13 +107,27 @@ def collect_ap_links(page) -> set[str]:
     return out
 
 
-def collect_i_links(page) -> set[str]:
-    hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-    out = set()
-    for h in hrefs:
-        h = normalize_url(h)
-        if h and "/i/" in h:
-            out.add(h)
+def extract_product_urls_from_html(html: str) -> set[str]:
+    """
+    Robuste Extraktion von /de/i/... Links aus dem gerenderten HTML,
+    auch wenn sie nicht als <a href> im DOM auftauchen.
+    """
+    out: set[str] = set()
+
+    # 1) Vollständige URLs
+    for m in re.findall(r"https?://www\.redbubble\.com/de/i/[^\s\"'<>\\]+", html):
+        out.add(normalize_url(m) or m)
+
+    # 2) Relative Pfade (auch escaped \/de\/i\/...)
+    # unescaped
+    for m in re.findall(r"(/de/i/[^\s\"'<>\\]+)", html):
+        out.add(normalize_url(BASE_DOMAIN + m) or (BASE_DOMAIN + m))
+
+    # escaped
+    for m in re.findall(r"(\\/de\\/i\\/[^\s\"'<>\\]+)", html):
+        m2 = m.replace("\\/", "/")
+        out.add(normalize_url(BASE_DOMAIN + m2) or (BASE_DOMAIN + m2))
+
     return out
 
 
@@ -140,7 +153,7 @@ def main():
         page = context.new_page()
 
         # =========================
-        # 1) EXPLORE: alle /shop/ap/
+        # 1) EXPLORE: /shop/ap/ sammeln
         # =========================
         no_add_pages = 0
         for pno in range(1, MAX_EXPLORE_PAGES + 1):
@@ -149,7 +162,7 @@ def main():
             page.wait_for_timeout(WAIT_FIRST_MS)
             try_accept_cookies(page)
 
-            # manchmal lazy-load -> etwas scrollen
+            # etwas scrollen, falls lazy-load
             try:
                 page.wait_for_selector('a[href*="/shop/ap/"]', timeout=10_000)
             except PWTimeout:
@@ -164,7 +177,7 @@ def main():
                     pass
 
             before = len(ap_urls)
-            ap_urls |= collect_ap_links(page)
+            ap_urls |= collect_ap_links_from_dom(page)
             added = len(ap_urls) - before
             print(f"explore page {pno}: +{added} designs (total {len(ap_urls)})")
 
@@ -173,30 +186,33 @@ def main():
             else:
                 no_add_pages = 0
 
-            # wenn 2 Seiten hintereinander nichts Neues: Ende
             if pno >= 2 and no_add_pages >= 2:
                 break
 
-        # =========================================
-        # 2) pro /shop/ap/ -> /i/ Produktlinks holen
-        # =========================================
-        ap_list = sorted(list(ap_urls))[:MAX_DESIGNS_TO_EXPAND]
+        print(f"✅ designs collected: {len(ap_urls)}")
+
+        # =========================
+        # 2) pro /shop/ap/: Produktlinks (/de/i/...) extrahieren
+        # =========================
+        ap_list = sorted(ap_urls)[:MAX_DESIGNS_TO_EXPAND]
 
         for idx, ap in enumerate(ap_list, start=1):
             page.goto(ap, wait_until="domcontentloaded", timeout=90_000)
             page.wait_for_timeout(WAIT_FIRST_MS)
             try_accept_cookies(page)
 
-            # auf Designseite scrollen, damit Produktkacheln laden
+            # scroll, damit mehr Produkte gerendert werden
             scroll_page(page, SCROLL_ROUNDS_AP)
 
-            links = sorted(list(collect_i_links(page)))[:MAX_PRODUCTS_PER_DESIGN]
+            html = page.content()
+            found = extract_product_urls_from_html(html)
+
             before = len(product_urls)
-            product_urls.update(links)
+            product_urls |= found
             added = len(product_urls) - before
 
             if idx == 1:
-                DEBUG_AP1_HTML.write_text(page.content(), encoding="utf-8")
+                DEBUG_AP1_HTML.write_text(html, encoding="utf-8")
                 try:
                     page.screenshot(path=str(DEBUG_AP1_PNG), full_page=True)
                 except Exception:
@@ -208,14 +224,13 @@ def main():
         context.close()
         browser.close()
 
-    # sitemap = Produktseiten (/i/) für Mockup-Bilder
     urls_sorted = sorted(product_urls)
 
     write_sitemap(urls_sorted)
     OUT_URLS.write_text("\n".join(urls_sorted) + ("\n" if urls_sorted else ""), encoding="utf-8")
     OUT_COUNT.write_text(str(len(urls_sorted)) + "\n", encoding="utf-8")
 
-    print(f"✅ OK: {len(urls_sorted)} URLs (products), designs_found={len(ap_urls)}")
+    print(f"✅ OK: {len(urls_sorted)} product URLs | designs_seen={len(ap_urls)}")
 
 
 if __name__ == "__main__":
