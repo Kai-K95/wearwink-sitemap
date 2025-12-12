@@ -7,6 +7,9 @@ from urllib.parse import urlencode, urlparse, parse_qsl
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 
+# =========================
+# CONFIG (optional via ENV)
+# =========================
 RB_USER = os.getenv("RB_USER", "wearwink")
 
 SHOP_BASE_URLS = [
@@ -14,8 +17,8 @@ SHOP_BASE_URLS = [
     f"https://www.redbubble.com/people/{RB_USER}/shop?asc=u",
 ]
 
-MAX_SHOP_PAGES = int(os.getenv("MAX_SHOP_PAGES", "20"))                 # wie viele Shop-Seiten scannen
-MAX_DESIGNS_TO_EXPAND = int(os.getenv("MAX_DESIGNS_TO_EXPAND", "200"))  # wie viele Designs wir besuchen
+MAX_SHOP_PAGES = int(os.getenv("MAX_SHOP_PAGES", "20"))                 # Listing-Seiten scannen
+MAX_DESIGNS_TO_EXPAND = int(os.getenv("MAX_DESIGNS_TO_EXPAND", "60"))   # wie viele /shop/ap/ Designs besuchen
 SCROLL_ROUNDS_LISTING = int(os.getenv("SCROLL_ROUNDS_LISTING", "10"))
 SCROLL_ROUNDS_DESIGN = int(os.getenv("SCROLL_ROUNDS_DESIGN", "12"))
 SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "900"))
@@ -30,6 +33,7 @@ DEBUG_PNG = Path("debug_page1.png")
 
 
 def with_page(url: str, page: int) -> str:
+    """Setzt/ändert page= in der URL (sofern RB es akzeptiert)."""
     u = urlparse(url)
     q = dict(parse_qsl(u.query))
     if "redbubble.com/people/" in url:
@@ -67,6 +71,7 @@ def write_sitemap(urls: list[str]) -> None:
 
 
 def try_accept_cookies(page) -> None:
+    """Best-effort Cookie/Consent Klick (falls vorhanden)."""
     patterns = [
         r"(accept|agree|i agree|allow all)",
         r"(zustimmen|akzeptieren|alle akzeptieren|einverstanden)",
@@ -91,6 +96,7 @@ def scroll_page(page, rounds: int) -> None:
 
 
 def pick_working_shop_url(page) -> str | None:
+    """Wählt eine Shop-URL, bei der wir überhaupt Links (i/ oder shop/ap) finden."""
     for base in SHOP_BASE_URLS:
         try:
             page.goto(base, wait_until="domcontentloaded", timeout=90_000)
@@ -98,47 +104,53 @@ def pick_working_shop_url(page) -> str | None:
             try_accept_cookies(page)
 
             try:
-                page.wait_for_selector('a[href*="/shop/ap/"], a[href*="/i/"]', timeout=12_000)
+                page.wait_for_selector('a[href*="/i/"], a[href*="/shop/ap/"]', timeout=12_000)
             except PWTimeout:
                 pass
 
-            scroll_page(page, 6)
+            scroll_page(page, 4)
+
             hrefs = page.eval_on_selector_all('a[href]', "els => els.map(e => e.href)")
             ok = 0
             for h in hrefs:
                 h = normalize_url(h)
-                if h and ("/shop/ap/" in h or "/i/" in h):
+                if h and ("/i/" in h or "/shop/ap/" in h):
                     ok += 1
             if ok > 0:
                 return base
         except Exception:
             continue
+
     return None
 
 
-def collect_design_links_from_listing(page) -> set[str]:
+def collect_listing_links(page) -> tuple[set[str], set[str]]:
+    """Sammelt aus dem Listing sowohl Designs (/shop/ap/) als auch Produktseiten (/i/)."""
     hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
     designs: set[str] = set()
+    products: set[str] = set()
+
     for h in hrefs:
         h = normalize_url(h)
         if not h:
             continue
         if "/shop/ap/" in h:
             designs.add(h)
-    return designs
+        if "/i/" in h:
+            products.add(h)
+
+    return designs, products
 
 
 def collect_product_links_from_design(page) -> set[str]:
-    # Auf Design-Seiten tauchen oft mehrere /i/<product>/... Links auf (Mockups)
+    """Sammelt /i/ Links von einer Design-Seite (/shop/ap/...)."""
     hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-    prods: set[str] = set()
+    products: set[str] = set()
     for h in hrefs:
         h = normalize_url(h)
-        if not h:
-            continue
-        if "/i/" in h:
-            prods.add(h)
-    return prods
+        if h and "/i/" in h:
+            products.add(h)
+    return products
 
 
 def main():
@@ -164,6 +176,7 @@ def main():
 
         base = pick_working_shop_url(page)
         if not base:
+            # Debug sichern: was wurde geladen?
             DEBUG_HTML.write_text(page.content(), encoding="utf-8")
             try:
                 page.screenshot(path=str(DEBUG_PNG), full_page=True)
@@ -178,23 +191,44 @@ def main():
             browser.close()
             return
 
-        # Phase 1: Design-URLs aus dem Listing sammeln
+        # =========================
+        # Phase 1: Listing scannen
+        # =========================
         for i in range(1, MAX_SHOP_PAGES + 1):
             url = with_page(base, i)
             page.goto(url, wait_until="domcontentloaded", timeout=90_000)
             page.wait_for_timeout(WAIT_FIRST_MS)
             try_accept_cookies(page)
+
             scroll_page(page, SCROLL_ROUNDS_LISTING)
 
-            before = len(design_urls)
-            design_urls |= collect_design_links_from_listing(page)
-            added = len(design_urls) - before
-            print(f"listing page {i}: +{added} designs (total {len(design_urls)})")
+            # Debug IMMER von Listing-Seite 1 speichern
+            if i == 1:
+                DEBUG_HTML.write_text(page.content(), encoding="utf-8")
+                try:
+                    page.screenshot(path=str(DEBUG_PNG), full_page=True)
+                except Exception:
+                    pass
 
-            if added == 0 and i >= 2:
+            before_d = len(design_urls)
+            before_p = len(product_urls)
+
+            d, p_links = collect_listing_links(page)
+            design_urls |= d
+            product_urls |= p_links
+
+            print(
+                f"listing page {i}: +{len(design_urls)-before_d} designs (total {len(design_urls)}), "
+                f"+{len(product_urls)-before_p} products (total {len(product_urls)})"
+            )
+
+            # Wenn 2 Seiten hintereinander nichts Neues bringen -> Ende
+            if i >= 2 and (len(design_urls) == before_d) and (len(product_urls) == before_p):
                 break
 
-        # Phase 2: Jede Design-Seite besuchen und /i/ Produktlinks sammeln
+        # ==========================================
+        # Phase 2: Designs besuchen und /i/ erweitern
+        # ==========================================
         designs_list = sorted(list(design_urls))[:MAX_DESIGNS_TO_EXPAND]
         for idx, durl in enumerate(designs_list, start=1):
             page.goto(durl, wait_until="domcontentloaded", timeout=90_000)
@@ -210,8 +244,9 @@ def main():
         context.close()
         browser.close()
 
-    # Sitemap: sowohl Designs als auch Produktlinks (damit BlogToPin beides kann)
+    # Sitemap enthält ALLE Links (Design + Produkt)
     all_urls = sorted(list(design_urls | product_urls))
+
     write_sitemap(all_urls)
     OUT_URLS.write_text("\n".join(all_urls) + ("\n" if all_urls else ""), encoding="utf-8")
     OUT_COUNT.write_text(str(len(all_urls)) + "\n", encoding="utf-8")
