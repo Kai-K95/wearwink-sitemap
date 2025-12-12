@@ -1,28 +1,23 @@
-import re
-import time
+from __future__ import annotations
+
 import json
 import random
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone, date
 from pathlib import Path
-from datetime import datetime, timezone
+from typing import Dict, List, Set, Tuple
 
 import requests
-
+from bs4 import BeautifulSoup
 
 # =========================
-# SETTINGS (hier anpassen)
+# CONFIG
 # =========================
-USERNAME = "WearWink"
-BASE = "https://www.redbubble.com"
+ARTIST = "WearWink"
 
-# WIE VIEL CRAWLEN? (wenig!)
-PAGES_PER_CATEGORY_SCAN = 1  # 1 = sehr wenig / stabil. (optional 2)
-
-# WIE VIELE URLs SOLLEN IN DIE SITEMAP?
-MAX_SITEMAP_URLS = 2000
-
-# Optional: Pool-Limit pro Kategorie (damit repo klein bleibt)
-MAX_POOL_PER_CATEGORY = 5000
-
+# Deine Kategorien (iaCode)
 IA_CODES = [
     "w-dresses",
     "u-sweatshirts",
@@ -64,263 +59,275 @@ IA_CODES = [
     "u-bag-studiopouch",
 ]
 
-# Output
-OUT_SITEMAP_XML = Path("sitemap.xml")
-OUT_SITEMAP_TXT = Path("sitemap.txt")
-LAST_COUNT = Path("last_count.txt")
+# Wie viele Listing-Seiten pro Kategorie wir pro Run anfassen (klein halten -> weniger Block)
+PAGES_PER_CATEGORY_POOL = 1
 
-POOL_JSON = Path("pool_by_category.json")
-USED_JSON = Path("used_by_category.json")
+# Wie viele URLs total in die Sitemap sollen (Rotation)
+TOTAL_DAILY_LIMIT = 2000
 
+# Wartezeit zwischen Requests (klein aber hilft)
+SLEEP_MIN = 0.8
+SLEEP_MAX = 1.8
+
+# Output Files
+OUT_SITEMAP = Path("sitemap.xml")
+OUT_URLS = Path("urls.txt")
+OUT_COUNT = Path("last_count.txt")
+
+CACHE_POOL = Path("cache_by_category.json")   # iaCode -> [product_url...]
+CACHE_USED = Path("state_used.json")          # iaCode -> [already_used_url...]
+
+DEBUG_LISTING_HTML = Path("debug_listing.html")
+
+BASE = "https://www.redbubble.com"
+LISTING_BASE = f"{BASE}/people/{ARTIST}/shop"
 
 # =========================
-# HTTP / Parsing
+# Helpers
 # =========================
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",  # kein /de/
-    "Connection": "keep-alive",
-}
 
-# Produkt-URLs (abs/rel), optional /de/
-RE_PRODUCT_ABS = re.compile(r"https?://www\.redbubble\.com/(?:de/)?i/[^\"<>\s]+", re.I)
-RE_PRODUCT_REL = re.compile(r"/(?:de/)?i/[^\"<>\s]+", re.I)
+def now_lastmod() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-CF_MARKERS = [
-    "cloudflare",
-    "cf-chl",
-    "verify you are human",
-    "checking your browser",
-    "Bestätigen Sie, dass Sie ein Mensch sind",
-    "muss die Sicherheit Ihrer Verbindung überprüfen",
-]
-
+def xml_escape_loc(u: str) -> str:
+    # Wichtig: & muss in XML escaped werden, sonst bekommst du genau den Browser-Fehler "EntityRef expecting ;"
+    return (
+        u.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&apos;")
+    )
 
 def is_cloudflare_block(html: str) -> bool:
     h = html.lower()
-    return any(m.lower() in h for m in CF_MARKERS)
-
-
-def normalize_product_url(u: str) -> str:
-    u = u.strip()
-    if u.startswith("http://"):
-        u = "https://" + u[len("http://") :]
-
-    # /de/ raus
-    u = u.replace("https://www.redbubble.com/de/i/", "https://www.redbubble.com/i/")
-    u = u.replace("https://www.redbubble.com/de/", "https://www.redbubble.com/")
-
-    u = u.split("#", 1)[0]
-    return u
-
-
-def build_listing_url(page: int, ia_code: str) -> str:
+    # typische Marker
     return (
-        f"{BASE}/people/{USERNAME}/shop"
-        f"?artistUserName={USERNAME}"
+        "cloudflare" in h
+        or "verify you are human" in h
+        or "confirm you are human" in h
+        or "checking your browser" in h
+        or "cdn-cgi" in h
+        or "ray id" in h
+        or "muss die sicherheit ihrer verbindung" in h
+        or "bestätigen sie, dass sie ein mensch sind" in h
+    )
+
+def build_listing_url(ia_code: str, page: int) -> str:
+    # Wichtig: keine /de/ URLs, nur www.redbubble.com
+    # sortOrder=recent damit du immer "neu" zuerst bekommst
+    return (
+        f"{LISTING_BASE}"
+        f"?artistUserName={ARTIST}"
         f"&asc=u"
         f"&sortOrder=recent"
         f"&page={page}"
         f"&iaCode={ia_code}"
     )
 
-
-def fetch_html(url: str, timeout: int = 30) -> str | None:
-    time.sleep(0.35 + random.random() * 0.55)
-
-    for attempt in range(3):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=timeout)
-            if r.status_code != 200:
-                time.sleep(1.0 * (attempt + 1))
-                continue
-
-            html = r.text
-            if is_cloudflare_block(html):
-                return None
-            return html
-        except Exception:
-            time.sleep(1.0 * (attempt + 1))
-    return None
-
-
-def extract_product_urls(html: str) -> set[str]:
-    urls: set[str] = set()
-
-    for u in RE_PRODUCT_ABS.findall(html):
-        urls.add(normalize_product_url(u))
-
-    for rel in RE_PRODUCT_REL.findall(html):
-        urls.add(normalize_product_url(BASE + rel))
-
-    return urls
-
-
 def load_json(path: Path, default):
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+    return default
 
 def save_json(path: Path, obj) -> None:
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def fetch(url: str) -> Tuple[str | None, int]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        return r.text, r.status_code
+    except Exception:
+        return None, 0
 
-def write_sitemap_xml(urls: list[str]) -> None:
-    def esc(s: str) -> str:
-        return (
-            s.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&apos;")
-        )
+PRODUCT_RE = re.compile(r"^https?://www\.redbubble\.com/i/[^?#]+", re.IGNORECASE)
 
-    lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def extract_product_urls(html: str) -> Set[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    out: Set[str] = set()
 
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith("/"):
+            href = BASE + href
+        if PRODUCT_RE.match(href):
+            # normalize: https + without fragments
+            href = href.split("#", 1)[0]
+            out.add(href)
+    return out
+
+def compute_quota(categories: List[str], total_limit: int) -> Dict[str, int]:
+    n = len(categories)
+    base = total_limit // n
+    rem = total_limit % n
+    # stabile Verteilung: erste rem Kategorien bekommen +1
+    cats_sorted = sorted(categories)
+    q = {}
+    for i, c in enumerate(cats_sorted):
+        q[c] = base + (1 if i < rem else 0)
+    return q
+
+def pick_rotating(pool: List[str], used: Set[str], k: int, seed: int) -> Tuple[List[str], Set[str]]:
+    # nur URLs, die noch nicht benutzt wurden
+    candidates = [u for u in pool if u not in used]
+
+    rnd = random.Random(seed)
+    rnd.shuffle(candidates)
+
+    picked = candidates[:k]
+
+    # wenn nicht genug da: reset used (Rotation neu starten), dann nochmal versuchen
+    if len(picked) < k:
+        used = set()  # reset
+        candidates = list(pool)
+        rnd.shuffle(candidates)
+        picked = candidates[:k]
+
+    used.update(picked)
+    return picked, used
+
+def write_sitemap(urls: List[str]) -> None:
+    lastmod = now_lastmod()
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
     for u in urls:
         lines.append("  <url>")
-        lines.append(f"    <loc>{esc(u)}</loc>")
+        lines.append(f"    <loc>{xml_escape_loc(u)}</loc>")
         lines.append(f"    <lastmod>{lastmod}</lastmod>")
         lines.append("  </url>")
     lines.append("</urlset>")
+    OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    OUT_SITEMAP_XML.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def write_sitemap_txt(urls: list[str]) -> None:
-    OUT_SITEMAP_TXT.write_text("\n".join(urls) + "\n", encoding="utf-8")
-
-
-def pick_rotating(pool: list[str], used: set[str], k: int, rnd: random.Random) -> tuple[list[str], set[str]]:
-    if not pool or k <= 0:
-        return [], used
-
-    available = [u for u in pool if u not in used]
-    if len(available) < k:
-        used = set()
-        available = pool[:]
-
-    rnd.shuffle(available)
-    chosen = available[:k]
-    used.update(chosen)
-    return chosen, used
-
+def write_outputs(urls: List[str]) -> None:
+    # urls.txt ist optional für dich, aber praktisch zum Debuggen
+    OUT_URLS.write_text("\n".join(urls) + "\n", encoding="utf-8")
+    OUT_COUNT.write_text(str(len(urls)) + "\n", encoding="utf-8")
+    write_sitemap(urls)
 
 def main() -> None:
-    random.seed()
+    # Cache laden
+    pool_by_cat: Dict[str, List[str]] = load_json(CACHE_POOL, {})
+    used_by_cat: Dict[str, List[str]] = load_json(CACHE_USED, {})
 
-    pool_by_cat: dict[str, list[str]] = load_json(POOL_JSON, {})
-    used_by_cat_raw: dict[str, list[str]] = load_json(USED_JSON, {})
-
-    # normalize structures
+    # sicherstellen, dass alle Kategorien existieren
     for ia in IA_CODES:
         pool_by_cat.setdefault(ia, [])
-        used_by_cat_raw.setdefault(ia, [])
-
-    used_by_cat: dict[str, set[str]] = {ia: set(used_by_cat_raw.get(ia, [])) for ia in IA_CODES}
-
-    newly_found_total = 0
-    blocked_pages = 0
-    scanned_pages = 0
+        used_by_cat.setdefault(ia, [])
 
     print("== Crawling listing pages (low) ==")
+    scanned = 0
+    blocked = 0
+    newly_found = 0
+
+    first_debug_saved = False
 
     for ia in IA_CODES:
-        for page in range(1, PAGES_PER_CATEGORY_SCAN + 1):
-            url = build_listing_url(page, ia)
-            html = fetch_html(url)
-            scanned_pages += 1
+        for page in range(1, PAGES_PER_CATEGORY_POOL + 1):
+            url = build_listing_url(ia, page)
+            scanned += 1
 
-            if not html:
-                blocked_pages += 1
-                print(f"BLOCKED/EMPTY: {ia} page={page}")
+            html, status = fetch(url)
+            if html is None:
+                print(f"BLOCKED/EMPTY: {ia} page={page} (no response)")
+                blocked += 1
                 continue
 
-            found = sorted(extract_product_urls(html))
-            if found:
-                before = set(pool_by_cat[ia])
-                merged = list(before | set(found))
-                # limit per category pool
-                if len(merged) > MAX_POOL_PER_CATEGORY:
-                    merged = merged[-MAX_POOL_PER_CATEGORY:]
-                pool_by_cat[ia] = sorted(merged)
-                newly_found_total += len(set(found) - before)
-                print(f"OK: {ia} page={page} +{len(found)} products (pool={len(pool_by_cat[ia])})")
-            else:
-                print(f"OK: {ia} page={page} +0 products")
+            if is_cloudflare_block(html) or status in (403, 429):
+                print(f"BLOCKED/EMPTY: {ia} page={page}")
+                blocked += 1
+                if not first_debug_saved:
+                    DEBUG_LISTING_HTML.write_text(html, encoding="utf-8")
+                    first_debug_saved = True
+                continue
 
-    # Wenn komplett blockiert (und schon eine Sitemap existiert) -> nichts überschreiben
-    total_pool_size = sum(len(pool_by_cat[ia]) for ia in IA_CODES)
-    if newly_found_total == 0 and blocked_pages > 0 and OUT_SITEMAP_XML.exists() and total_pool_size > 0:
-        print("No new products found (likely blocked). Keeping existing outputs.")
-        return
+            urls = extract_product_urls(html)
 
-    # ======= QUOTA pro Kategorie =======
-    ncat = len(IA_CODES)
-    base_quota = MAX_SITEMAP_URLS // ncat
-    remainder = MAX_SITEMAP_URLS - base_quota * ncat  # diese Kategorien bekommen +1
+            if not urls:
+                print(f"EMPTY: {ia} page={page}")
+                continue
 
-    # Tages-Seed für stabile Rotation pro Tag
-    day_seed = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    rnd_global = random.Random(day_seed)
+            before = set(pool_by_cat[ia])
+            merged = list(before.union(urls))
+            pool_by_cat[ia] = merged
+            add = len(set(merged) - before)
+            newly_found += add
 
-    cats_today = IA_CODES[:]
-    rnd_global.shuffle(cats_today)
+            print(f"OK: {ia} page={page} +{add} (pool={len(pool_by_cat[ia])})")
 
-    chosen_all: list[str] = []
+            time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
 
-    print("== Picking rotating URLs per category ==")
-    for idx, ia in enumerate(cats_today):
-        quota = base_quota + (1 if idx < remainder else 0)
+    total_pool = sum(len(v) for v in pool_by_cat.values())
 
+    print("\n== Picking rotating URLs per category ==")
+    print(f"Scanned listing pages: {scanned}")
+    print(f"Blocked/empty pages: {blocked}")
+    print(f"Newly found total: {newly_found}")
+    print(f"Total pool size: {total_pool}")
+
+    # WICHTIG: Wenn wir heute komplett geblockt sind UND der Pool leer ist,
+    # DANN NICHT outputs auf 0 überschreiben -> alte files bleiben.
+    if total_pool == 0:
+        if OUT_SITEMAP.exists() and OUT_COUNT.exists():
+            print("❗ Pool is 0. Keeping existing sitemap.xml/last_count.txt unchanged.")
+            # trotzdem Cache speichern (leer/alt)
+            save_json(CACHE_POOL, pool_by_cat)
+            save_json(CACHE_USED, used_by_cat)
+            return
+        else:
+            print("❌ Pool is 0 and no previous outputs exist. Nothing to write.")
+            # Cache speichern
+            save_json(CACHE_POOL, pool_by_cat)
+            save_json(CACHE_USED, used_by_cat)
+            return
+
+    # Cache/State speichern (damit Rotation täglich funktioniert)
+    save_json(CACHE_POOL, pool_by_cat)
+
+    # Quoten: 2000 / Anzahl Kategorien
+    quota = compute_quota(IA_CODES, TOTAL_DAILY_LIMIT)
+    base = TOTAL_DAILY_LIMIT // len(IA_CODES)
+    rem = TOTAL_DAILY_LIMIT % len(IA_CODES)
+    print(f"Quota: base={base}, remainder(+1)={rem}, categories={len(IA_CODES)}")
+
+    # täglicher Seed: rotiert automatisch pro Tag, aber stabil innerhalb eines Tages
+    seed = int(date.today().strftime("%Y%m%d"))
+
+    final_urls: List[str] = []
+
+    for ia in sorted(IA_CODES):
         pool = pool_by_cat.get(ia, [])
         if not pool:
             continue
 
-        # eigener RNG pro Kategorie (damit jede Kategorie unabhängig rotiert)
-        rnd_cat = random.Random(f"{day_seed}|{ia}")
+        used_set = set(used_by_cat.get(ia, []))
+        k = quota[ia]
 
-        chosen, used_new = pick_rotating(pool, used_by_cat.get(ia, set()), quota, rnd_cat)
-        used_by_cat[ia] = used_new
-        chosen_all.extend(chosen)
+        picked, new_used = pick_rotating(pool, used_set, k, seed + hash(ia) % 100000)
+        used_by_cat[ia] = list(new_used)
 
-    # final mischen (damit nicht Kategorie-Blockweise)
-    rnd_global.shuffle(chosen_all)
+        final_urls.extend(picked)
 
-    # hart begrenzen (falls leere Kategorien -> weniger als 2000, ist ok)
-    chosen_all = chosen_all[:MAX_SITEMAP_URLS]
+    # used speichern
+    save_json(CACHE_USED, used_by_cat)
 
-    # Outputs schreiben
-    write_sitemap_xml(chosen_all)
-    write_sitemap_txt(chosen_all)
-    LAST_COUNT.write_text(str(len(chosen_all)) + "\n", encoding="utf-8")
+    # dedupe final (nur falls)
+    final_urls = list(dict.fromkeys(final_urls))
 
-    # Persist
-    save_json(POOL_JSON, pool_by_cat)
-    save_json(USED_JSON, {ia: sorted(list(used_by_cat[ia])) for ia in IA_CODES})
-
-    print("===================================")
-    print(f"Scanned listing pages: {scanned_pages}")
-    print(f"Blocked/empty pages:   {blocked_pages}")
-    print(f"Newly found total:     {newly_found_total}")
-    print(f"Total pool size:       {total_pool_size}")
-    print(f"Wrote sitemap URLs:    {len(chosen_all)}")
-    print(f"Quota: base={base_quota}, remainder(+1)={remainder}, categories={ncat}")
-    print("===================================")
-
+    write_outputs(final_urls)
+    print(f"✅ OK: wrote {len(final_urls)} product URLs")
 
 if __name__ == "__main__":
     main()
