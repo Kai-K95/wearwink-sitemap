@@ -1,25 +1,21 @@
 from __future__ import annotations
 
-import random
-import shutil
-import zlib
 from datetime import datetime, timezone
+from math import ceil
 from pathlib import Path
 from urllib.parse import urlencode
+import xml.etree.ElementTree as ET
 
-# === Einstellungen ===
-SITE_BASE = "https://kai-k95.github.io/wearwink-sitemap"  # dein GitHub Pages Base
+# =========================
+# CONFIG
+# =========================
+
 ARTIST = "WearWink"
-RB_BASE = f"https://www.redbubble.com/people/{ARTIST}/shop"
 
-TOTAL_URLS = 2000                 # Gesamtlimit (wie von dir gewünscht)
-POOL_PAGES_PER_CATEGORY = 200     # aus wie vielen Seiten wir pro Kategorie "ziehen" (Rotation)
-# =====================
+# Nur "www.redbubble.com" (ohne /de/)
+BASE = f"https://www.redbubble.com/people/{ARTIST}/shop"
 
-OUT_SITEMAP = Path("sitemap.xml")
-OUT_COUNT = Path("last_count.txt")
-C_DIR = Path("c")
-
+# Deine iaCodes (38 Stück – wie in deinen Logs)
 IA_CODES = [
     "w-dresses",
     "u-sweatshirts",
@@ -61,7 +57,19 @@ IA_CODES = [
     "u-bag-studiopouch",
 ]
 
-def rb_url(page: int, ia_code: str) -> str:
+# Zielgröße ~2000 URLs insgesamt (bei 38 Kategorien => 53 Seiten pro Kategorie => 2014 URLs)
+TOTAL_TARGET_URLS = 2000
+
+# Output
+OUT_SITEMAP = Path("sitemap.xml")
+OUT_COUNT = Path("last_count.txt")
+OUT_URLS_TXT = Path("urls.txt")
+
+
+def build_category_page_url(ia_code: str, page: int) -> str:
+    """
+    Redbubble Category-Listing URL für deinen Shop.
+    """
     params = {
         "artistUserName": ARTIST,
         "asc": "u",
@@ -69,97 +77,54 @@ def rb_url(page: int, ia_code: str) -> str:
         "page": str(page),
         "iaCode": ia_code,
     }
-    return f"{RB_BASE}?{urlencode(params)}"
+    return f"{BASE}?{urlencode(params)}"
 
-def xml_escape(s: str) -> str:
-    # wichtig: & muss zu &amp; werden, sonst XML-Fehler
-    return (
-        s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-         .replace('"', "&quot;")
-         .replace("'", "&apos;")
-    )
 
-def write_redirect_page(path: Path, target_url: str) -> None:
-    # BlogToPin sieht hier eine echte Seite unter /c/<cat>/pXX.html
-    # und kann (je nach Setup) dem Link/Redirect folgen.
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta http-equiv="refresh" content="0; url={target_url}"/>
-  <link rel="canonical" href="{target_url}"/>
-  <title>Redirect</title>
-</head>
-<body>
-  <p>Redirecting to Redbubble…</p>
-  <p><a href="{target_url}">{target_url}</a></p>
-</body>
-</html>
-"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(html, encoding="utf-8")
+def generate_urls() -> list[str]:
+    categories = list(dict.fromkeys(IA_CODES))  # unique, order behalten
+    n = len(categories)
+    pages_per_category = max(1, ceil(TOTAL_TARGET_URLS / n))  # z.B. 53
 
-def quota_per_category(categories: int, total: int) -> int:
-    # gleichmäßig verteilen, aufrunden damit wir nah an TOTAL_URLS kommen
-    # Beispiel: 2000/38 => 52.x -> 53
-    return max(1, (total + categories - 1) // categories)
+    urls: list[str] = []
+    for ia in categories:
+        for page in range(1, pages_per_category + 1):
+            urls.append(build_category_page_url(ia, page))
 
-def pick_rotating_pages(ia_code: str, k: int, pool_max: int) -> list[int]:
-    day_seed = int(datetime.now(timezone.utc).strftime("%Y%m%d"))  # täglicher Seed
-    salt = zlib.crc32(ia_code.encode("utf-8")) & 0xFFFFFFFF
-    rnd = random.Random(day_seed ^ salt)
+    # unique + stabil sortiert (nur falls du doppelte hast)
+    urls = sorted(set(urls))
 
-    k = min(k, pool_max)
-    pages = rnd.sample(range(1, pool_max + 1), k=k)
-    pages.sort()
-    return pages
+    print(f"✅ OK: wrote {len(urls)} URLs")
+    print(f"categories: {n} | pages per category: {pages_per_category}")
 
-def write_sitemap(locs: list[str]) -> None:
+    return urls
+
+
+def write_sitemap(urls: list[str]) -> None:
     lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
-    ]
-    for loc in locs:
-        lines.append("  <url>")
-        lines.append(f"    <loc>{xml_escape(loc)}</loc>")
-        lines.append(f"    <lastmod>{lastmod}</lastmod>")
-        lines.append("  </url>")
-    lines.append("</urlset>")
-    OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    urlset = ET.Element("urlset", attrib={"xmlns": "http://www.sitemaps.org/schemas/sitemap/0.9"})
+
+    for u in urls:
+        url_el = ET.SubElement(urlset, "url")
+        loc_el = ET.SubElement(url_el, "loc")
+        loc_el.text = u  # ElementTree escaped '&' automatisch korrekt
+
+        lm_el = ET.SubElement(url_el, "lastmod")
+        lm_el.text = lastmod
+
+    tree = ET.ElementTree(urlset)
+    tree.write(OUT_SITEMAP, encoding="utf-8", xml_declaration=True)
+
 
 def main() -> None:
-    # 1) Alte Redirect-Pages löschen -> damit “alte” wirklich weggehen
-    if C_DIR.exists():
-        shutil.rmtree(C_DIR)
+    urls = generate_urls()
 
-    cats = len(IA_CODES)
-    k = quota_per_category(cats, TOTAL_URLS)
+    write_sitemap(urls)
 
-    locs: list[str] = []
+    # Debug/Count
+    OUT_COUNT.write_text(str(len(urls)) + "\n", encoding="utf-8")
+    OUT_URLS_TXT.write_text("\n".join(urls) + "\n", encoding="utf-8")
 
-    for ia in IA_CODES:
-        pages = pick_rotating_pages(ia, k=k, pool_max=POOL_PAGES_PER_CATEGORY)
-
-        for p in pages:
-            # GitHub-Pages URL (damit BlogToPin Kategorien sieht)
-            local_rel = Path("c") / ia / f"p{p}.html"
-            local_url = f"{SITE_BASE}/{local_rel.as_posix()}"
-
-            # Redbubble Ziel
-            target = rb_url(p, ia)
-
-            # Redirect-Seite schreiben
-            write_redirect_page(local_rel, target)
-
-            locs.append(local_url)
-
-    locs.sort()
-    write_sitemap(locs)
-    OUT_COUNT.write_text(str(len(locs)) + "\n", encoding="utf-8")
-    print(f"✅ OK: wrote {len(locs)} URLs | categories={cats} | per_category={k}")
 
 if __name__ == "__main__":
     main()
