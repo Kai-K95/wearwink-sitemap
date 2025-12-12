@@ -1,3 +1,4 @@
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6,24 +7,36 @@ from urllib.parse import urlencode, urlparse, parse_qsl
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 
-# Wir probieren 2 Shop-URLs (manchmal liefert eine davon “voller” HTML)
-SHOP_URLS = [
-    "https://wearwink.redbubble.com/shop",
-    "https://www.redbubble.com/people/wearwink/shop?asc=u",
+# =========================
+# CONFIG (optional via ENV)
+# =========================
+RB_USER = os.getenv("RB_USER", "wearwink")
+
+# Wir probieren mehrere Shop-URLs, weil RB je nach Host anders ausliefert
+SHOP_BASE_URLS = [
+    f"https://{RB_USER}.redbubble.com/shop",
+    f"https://www.redbubble.com/people/{RB_USER}/shop?asc=u",
 ]
 
-MAX_PAGES = 10
+MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))            # max. Shop-Seiten
+SCROLL_ROUNDS = int(os.getenv("SCROLL_ROUNDS", "10"))    # wie oft scrollen pro Seite
+SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "900"))
+WAIT_FIRST_MS = int(os.getenv("WAIT_FIRST_MS", "2500"))
+
 OUT_SITEMAP = Path("sitemap.xml")
 OUT_COUNT = Path("last_count.txt")
+OUT_URLS = Path("urls.txt")
 
 DEBUG_HTML = Path("debug_page1.html")
 DEBUG_PNG = Path("debug_page1.png")
 
 
 def with_page(url: str, page: int) -> str:
+    """Setzt/ändert page= in der URL (wenn page= unterstützt wird)."""
     u = urlparse(url)
     q = dict(parse_qsl(u.query))
-    q.setdefault("asc", "u")
+    if "redbubble.com/people/" in url:
+        q.setdefault("asc", "u")
     if page > 1:
         q["page"] = str(page)
     else:
@@ -31,12 +44,14 @@ def with_page(url: str, page: int) -> str:
     return u._replace(query=urlencode(q)).geturl()
 
 
-def normalize(u: str) -> str | None:
-    if not u or not u.startswith("http"):
+def normalize_url(u: str) -> str | None:
+    if not u or not isinstance(u, str):
         return None
-    u = u.split("#", 1)[0].split("?", 1)[0]
+    if not u.startswith("http"):
+        return None
     if "redbubble.com" not in u:
         return None
+    u = u.split("#", 1)[0].split("?", 1)[0]
     return u
 
 
@@ -47,14 +62,77 @@ def write_sitemap(urls: list[str]) -> None:
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
     for u in urls:
-        lines += [
-            "  <url>",
-            f"    <loc>{u}</loc>",
-            f"    <lastmod>{lastmod}</lastmod>",
-            "  </url>",
-        ]
+        lines.append("  <url>")
+        lines.append(f"    <loc>{u}</loc>")
+        lines.append(f"    <lastmod>{lastmod}</lastmod>")
+        lines.append("  </url>")
     lines.append("</urlset>")
     OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def try_accept_cookies(page) -> None:
+    """Best-effort Cookie/Consent Klick (falls vorhanden)."""
+    patterns = [
+        r"(accept|agree|i agree|allow all)",
+        r"(zustimmen|akzeptieren|alle akzeptieren|einverstanden)",
+    ]
+    for pat in patterns:
+        try:
+            page.get_by_role("button", name=re.compile(pat, re.I)).click(timeout=2000)
+            break
+        except Exception:
+            pass
+
+
+def pick_working_shop_url(page) -> str | None:
+    """Wählt eine Shop-URL, die tatsächlich Produktlinks im DOM hat."""
+    for base in SHOP_BASE_URLS:
+        try:
+            page.goto(base, wait_until="domcontentloaded", timeout=90_000)
+            page.wait_for_timeout(WAIT_FIRST_MS)
+            try_accept_cookies(page)
+
+            # Versuche kurz zu warten, ob Produktlinks auftauchen
+            try:
+                page.wait_for_selector('a[href*="/i/"], a[href*="/shop/ap/"]', timeout=12_000)
+            except PWTimeout:
+                pass
+
+            links_now = page.eval_on_selector_all(
+                'a[href*="/i/"], a[href*="/shop/ap/"]',
+                "els => els.map(e => e.href)"
+            )
+            if links_now and len(links_now) > 0:
+                return base
+        except Exception:
+            continue
+
+    return None
+
+
+def collect_from_current_page(page) -> set[str]:
+    """Scrollt und sammelt Produkt-/Design-Links aus dem DOM."""
+    # Scrollen, damit mehr Kacheln laden
+    last_height = 0
+    for _ in range(SCROLL_ROUNDS):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(SCROLL_PAUSE_MS)
+        h = page.evaluate("document.body.scrollHeight")
+        if h == last_height:
+            break
+        last_height = h
+
+    hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+    out: set[str] = set()
+
+    for h in hrefs:
+        h = normalize_url(h)
+        if not h:
+            continue
+        if "/i/" in h or "/shop/ap/" in h:
+            out.add(h)
+
+    return out
 
 
 def main():
@@ -74,32 +152,14 @@ def main():
             locale="de-DE",
             viewport={"width": 1400, "height": 900},
         )
-
         # kleines Stealth: webdriver=false
         context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
 
         page = context.new_page()
 
-        used_shop = None
-
-        for base in SHOP_URLS:
-            try:
-                page.goto(base, wait_until="domcontentloaded", timeout=90_000)
-                # Warte kurz, ob Produktlinks auftauchen
-                page.wait_for_timeout(2500)
-                # Wenn Links da sind, nehmen wir diese Basis-URL
-                links_now = page.eval_on_selector_all(
-                    'a[href*="/i/"], a[href*="/shop/ap/"]',
-                    "els => els.map(e => e.href)"
-                )
-                if links_now and len(links_now) > 0:
-                    used_shop = base
-                    break
-            except Exception:
-                continue
-
-        if not used_shop:
-            # Debug sichern: was hat er überhaupt geladen?
+        base = pick_working_shop_url(page)
+        if not base:
+            # Debug sichern: was wurde geladen?
             DEBUG_HTML.write_text(page.content(), encoding="utf-8")
             try:
                 page.screenshot(path=str(DEBUG_PNG), full_page=True)
@@ -107,53 +167,49 @@ def main():
                 pass
 
             write_sitemap([])
+            OUT_URLS.write_text("", encoding="utf-8")
             OUT_COUNT.write_text("0\n", encoding="utf-8")
             print("page 1: +0 (total 0)")
             print("✅ OK: 0 URLs")
-            print("Found 0 product URLs.")
             print("DEBUG saved: debug_page1.html / debug_page1.png")
+            context.close()
+            browser.close()
             return
 
-        # Seiten durchgehen
+        empty_streak = 0
+
         for i in range(1, MAX_PAGES + 1):
-            url = with_page(used_shop, i)
+            url = with_page(base, i)
             page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-
-            # Warten bis Grid evtl. nachlädt
-            try:
-                page.wait_for_selector('a[href*="/i/"], a[href*="/shop/ap/"]', timeout=20_000)
-            except PWTimeout:
-                pass
-
-            # scroll, damit mehr Kacheln geladen werden
-            for _ in range(8):
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(900)
-
-            hrefs = page.eval_on_selector_all(
-                'a[href]',
-                "els => els.map(e => e.href)"
-            )
+            page.wait_for_timeout(WAIT_FIRST_MS)
+            try_accept_cookies(page)
 
             before = len(all_urls)
-            for h in hrefs:
-                h = normalize(h)
-                if not h:
-                    continue
-                if "/i/" in h or "/shop/ap/" in h:
-                    all_urls.add(h)
+            found = collect_from_current_page(page)
+            all_urls |= found
 
-            print(f"page {i}: +{len(all_urls)-before} (total {len(all_urls)})")
+            added = len(all_urls) - before
+            print(f"page {i}: +{added} (total {len(all_urls)})")
 
-            if len(all_urls) == before and i >= 2:
+            if added == 0:
+                empty_streak += 1
+            else:
+                empty_streak = 0
+
+            # Wenn 2 Seiten hintereinander nichts Neues bringen -> Ende
+            if empty_streak >= 2 and i >= 2:
                 break
 
         context.close()
         browser.close()
 
     urls_sorted = sorted(all_urls)
+
+    # Dateien schreiben
     write_sitemap(urls_sorted)
+    OUT_URLS.write_text("\n".join(urls_sorted) + ("\n" if urls_sorted else ""), encoding="utf-8")
     OUT_COUNT.write_text(str(len(urls_sorted)) + "\n", encoding="utf-8")
+
     print(f"✅ OK: {len(urls_sorted)} URLs")
 
 
