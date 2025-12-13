@@ -17,14 +17,11 @@ from bs4 import BeautifulSoup
 # CONFIG
 # =========================
 SHOP_USER = "WearWink"
+TARGET_URLS_DEFAULT = 1100
 
-TARGET_URLS = 1100
-
-# Discovery: klein halten, damit RB weniger blockt
+# Discovery: klein halten (RB blockt oft)
 EXPLORE_PAGES_TO_SCAN = 3
 LISTING_PAGES_PER_CATEGORY_TO_SCAN = 1
-
-# WICHTIG: pro Run nur ein Teil der IA Codes (Rotation)
 MAX_IA_CODES_PER_DISCOVERY_RUN = 6
 
 SLEEP_BETWEEN_REQUESTS_SEC = 1.2
@@ -72,22 +69,22 @@ IA_CODES = [
     "u-bag-studiopouch",
 ]
 
-# URL templates
 EXPLORE_URL = f"https://www.redbubble.com/people/{SHOP_USER}/explore?asc=u&page={{page}}&sortOrder=recent"
 LISTING_URL = (
     f"https://www.redbubble.com/people/{SHOP_USER}/shop"
     f"?artistUserName={SHOP_USER}&asc=u&sortOrder=recent&page={{page}}&iaCode={{ia}}"
 )
 
-# Files/Dirs
+# Repo structure
 DATA_DIR = Path("data")
 PUBLIC_DIR = Path("public")
 DEBUG_DIR = Path("debug")
 
 CACHE_JSON = DATA_DIR / "design_ids.json"
 USED_JSON = DATA_DIR / "used_ids.json"
-STATE_JSON = DATA_DIR / "state.json"  # für IA-Code Rotation Cursor
+STATE_JSON = DATA_DIR / "state.json"
 
+SEED_URLS = DATA_DIR / "seed_urls.txt"   # <-- DU FÜLLST DAS EINMALIG
 OUT_SITEMAP = PUBLIC_DIR / "sitemap.xml"
 
 
@@ -96,11 +93,9 @@ OUT_SITEMAP = PUBLIC_DIR / "sitemap.xml"
 # =========================
 ID_RE_AP = re.compile(r"/shop/ap/(\d+)")
 ID_RE_I = re.compile(r"/i/[^\"'\s<>]+/(\d+)(?:[/?#\"'\s<>]|$)")
+ID_RE_ANY_NUM = re.compile(r"\b(\d{6,})\b")
 
 
-# =========================
-# Helpers
-# =========================
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -169,7 +164,6 @@ def fetch_html(s: requests.Session, url: str, debug_name: str) -> str | None:
                 debug_write(f"{debug_name}_empty.html", text)
                 return None
 
-            # Debug: page1 speichern (hilft bei Änderungen im HTML)
             if debug_name.endswith("_p1"):
                 debug_write(f"{debug_name}.html", text)
 
@@ -199,11 +193,10 @@ def extract_ids_from_html(html: str) -> list[str]:
     except Exception:
         pass
 
-    # order-preserving dedupe
     seen: set[str] = set()
     out: list[str] = []
     for x in ids:
-        if x and x not in seen:
+        if x and x.isdigit() and x not in seen:
             seen.add(x)
             out.append(x)
     return out
@@ -225,8 +218,7 @@ def save_json(path: Path, obj: dict) -> None:
 def load_cache_ids() -> list[str]:
     data = load_json(CACHE_JSON, {"ids": {}})
     ids_map = data.get("ids", {}) if isinstance(data.get("ids", {}), dict) else {}
-    # keys sind die IDs
-    return [k for k in ids_map.keys() if k.isdigit()]
+    return [k for k in ids_map.keys() if isinstance(k, str) and k.isdigit()]
 
 
 def upsert_cache_ids(new_ids: list[str], source: str) -> int:
@@ -238,13 +230,12 @@ def upsert_cache_ids(new_ids: list[str], source: str) -> int:
 
     added = 0
     for pid in new_ids:
-        if not pid.isdigit():
+        if not isinstance(pid, str) or not pid.isdigit():
             continue
         if pid not in ids_map:
             ids_map[pid] = {"first_seen": now, "last_seen": now, "source": source}
             added += 1
         else:
-            # touch last_seen
             if isinstance(ids_map[pid], dict):
                 ids_map[pid]["last_seen"] = now
 
@@ -264,28 +255,19 @@ def load_used_set() -> set[str]:
 
 
 def save_used_set(used: set[str], last_reset: str | None = None) -> None:
-    obj = {"used": sorted(used), "last_reset": last_reset}
-    save_json(USED_JSON, obj)
+    save_json(USED_JSON, {"used": sorted(used), "last_reset": last_reset})
 
 
 def pick_rotating_ids(all_ids: list[str], used_ids: set[str], target: int) -> tuple[list[str], set[str], bool]:
-    """
-    Rotation:
-    - nimmt bevorzugt aus unbenutzten IDs
-    - wenn zu wenig verfügbar: reset used_ids
-    - deterministisches Shuffle pro Tag
-    Returns: (picked, new_used, did_reset)
-    """
     if not all_ids:
         return [], used_ids, False
 
-    # used bereinigen (IDs, die nicht mehr im Cache sind)
     all_set = set(all_ids)
     used_ids = {u for u in used_ids if u in all_set}
 
     available = [i for i in all_ids if i not in used_ids]
-
     did_reset = False
+
     if len(available) < target:
         used_ids = set()
         available = all_ids[:]
@@ -316,36 +298,24 @@ def write_sitemap(product_urls: list[str]) -> None:
 
 
 def choose_ia_codes_for_run() -> list[str]:
-    """
-    Rotiert IA-Codes über mehrere Runs, damit wir nicht jedes Mal alle abgrasen.
-    """
     ia = sorted(set(IA_CODES))
     if not ia:
         return []
-
     st = load_json(STATE_JSON, {"ia_cursor": 0})
     cursor = int(st.get("ia_cursor", 0)) if str(st.get("ia_cursor", "0")).isdigit() else 0
 
     k = min(MAX_IA_CODES_PER_DISCOVERY_RUN, len(ia))
-    chosen = []
-    for i in range(k):
-        chosen.append(ia[(cursor + i) % len(ia)])
-
+    chosen = [ia[(cursor + i) % len(ia)] for i in range(k)]
     st["ia_cursor"] = (cursor + k) % len(ia)
     save_json(STATE_JSON, st)
     return chosen
 
 
 def discover_design_ids() -> tuple[list[str], bool]:
-    """
-    Returns: (ids_found, blocked_any)
-    Best-effort: darf 0 liefern.
-    """
     s = session()
     found: list[str] = []
     blocked_any = False
 
-    # Explore (recent)
     for p in range(1, EXPLORE_PAGES_TO_SCAN + 1):
         url = EXPLORE_URL.format(page=p)
         html = fetch_html(s, url, debug_name=f"explore_p{p}")
@@ -353,18 +323,14 @@ def discover_design_ids() -> tuple[list[str], bool]:
             print(f"WARN: blocked/empty explore page={p}")
             blocked_any = True
             break
-
         ids = extract_ids_from_html(html)
         if not ids:
             print(f"INFO: no ids on explore page={p} (stop explore)")
             break
-
         found.extend(ids)
         time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
 
-    # Listings (subset of IA codes per run)
-    ia_subset = choose_ia_codes_for_run()
-    for ia in ia_subset:
+    for ia in choose_ia_codes_for_run():
         for p in range(1, LISTING_PAGES_PER_CATEGORY_TO_SCAN + 1):
             url = LISTING_URL.format(page=p, ia=ia)
             html = fetch_html(s, url, debug_name=f"listing_{ia}_p{p}")
@@ -372,41 +338,72 @@ def discover_design_ids() -> tuple[list[str], bool]:
                 print(f"WARN: blocked/empty ia={ia} page={p}")
                 blocked_any = True
                 break
-
             ids = extract_ids_from_html(html)
             if not ids:
                 print(f"INFO: no ids ia={ia} page={p} (stop ia)")
                 break
-
             found.extend(ids)
             time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
 
-    # dedupe preserve order
     seen: set[str] = set()
     out: list[str] = []
     for i in found:
         if i not in seen:
             seen.add(i)
             out.append(i)
-
     return out, blocked_any
 
 
-# =========================
-# Main
-# =========================
+def load_seed_ids() -> list[str]:
+    """
+    Liest data/seed_urls.txt und extrahiert IDs.
+    Akzeptiert:
+    - https://www.redbubble.com/shop/ap/<id>
+    - https://www.redbubble.com/i/.../<id>
+    - oder nur rohe Zahlen in der Zeile
+    """
+    if not SEED_URLS.exists():
+        return []
+    lines = [l.strip() for l in SEED_URLS.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
+
+    ids: list[str] = []
+    for line in lines:
+        ids.extend(ID_RE_AP.findall(line))
+        ids.extend(ID_RE_I.findall(line))
+        if not ids:
+            m = ID_RE_ANY_NUM.findall(line)
+            ids.extend(m)
+
+    out = []
+    seen = set()
+    for x in ids:
+        if x and x.isdigit() and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
 def main() -> int:
     ensure_dirs()
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--discover", action="store_true", help="Run best-effort discovery and update cache.")
-    ap.add_argument("--build", action="store_true", help="Build sitemap from cache (no discovery needed).")
-    ap.add_argument("--target", type=int, default=TARGET_URLS, help="How many product URLs in sitemap.")
+    ap.add_argument("--discover", action="store_true")
+    ap.add_argument("--build", action="store_true")
+    ap.add_argument("--target", type=int, default=TARGET_URLS_DEFAULT)
     args = ap.parse_args()
 
-    # Default: wenn nichts angegeben ist, beides machen (wie früher)
     run_discover = args.discover or (not args.discover and not args.build)
     run_build = args.build or (not args.discover and not args.build)
+
+    # 0) Seed in Cache bringen (wenn Cache leer)
+    cached_ids = load_cache_ids()
+    if not cached_ids:
+        seed_ids = load_seed_ids()
+        if seed_ids:
+            added = upsert_cache_ids(seed_ids, source="seed_urls")
+            print(f"OK: seeded cache from {SEED_URLS} | ids={len(seed_ids)} | added_new={added}")
+        else:
+            print(f"INFO: cache empty and no seed file or no IDs in {SEED_URLS}")
 
     # 1) Discovery (best effort)
     if run_discover:
@@ -419,13 +416,13 @@ def main() -> int:
             if blocked_any:
                 print("WARN: looks blocked/empty. See debug/*.html for details.")
 
-    # 2) Build sitemap (stabil!)
+    # 2) Build sitemap (stabil)
     if run_build:
         cached_ids = load_cache_ids()
         used_ids = load_used_set()
 
         if not cached_ids:
-            # Fallback: wenn sitemap schon existiert -> behalten, nicht sterben
+            # Wenn noch keine IDs: nur dann failen, wenn sitemap auch nicht existiert
             if OUT_SITEMAP.exists() and OUT_SITEMAP.stat().st_size > 200:
                 print("WARN: cache empty, but sitemap exists -> keeping existing sitemap.xml (exit 0).")
                 return 0
