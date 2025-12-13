@@ -13,6 +13,9 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
+# Playwright (Browser-Discovery)
+from playwright.sync_api import sync_playwright
+
 
 # =========================
 # CONFIG
@@ -21,65 +24,23 @@ SHOP_USER = "WearWink"
 
 TARGET_URLS_DEFAULT = 1100
 
-# Discovery (best effort; RB blockt oft)
-EXPLORE_PAGES_TO_SCAN = 3
-LISTING_PAGES_PER_CATEGORY_TO_SCAN = 1
-MAX_IA_CODES_PER_DISCOVERY_RUN = 6
+# URL Pool / Rotation
+ONLY_I_URLS = True  # True = Sitemap nur /i/ URLs (Mockups)
 
-SLEEP_BETWEEN_REQUESTS_SEC = 1.2
+# Seed wird JEDEN Run importiert (damit neue Designs sofort rein können)
+SEED_URLS_TXT = Path("data/seed_urls.txt")
+
+# Playwright Discovery (inkrementell, damit weniger Block)
+PW_DESIGNS_PER_RUN = 20           # pro Run wie viele Design-IDs abarbeiten
+PW_SLEEP_MIN = 2.0                # Sekunden
+PW_SLEEP_MAX = 4.5
+PW_HEADLESS_DEFAULT = True        # kannst du per Flag umstellen
+
+# Requests-Discovery (optional; bei dir oft geblockt, kann aber mal helfen)
+EXPLORE_PAGES_TO_SCAN = 2
 REQUEST_TIMEOUT_SEC = 20
-MAX_RETRIES = 3
-
-# Wenn du wirklich NUR /i/ willst (Mockups), lass True.
-# Wenn du als Notfall auch /shop/ap/<id> erlauben willst, setz False.
-ONLY_I_URLS = True
-
-IA_CODES = [
-    "w-dresses",
-    "u-sweatshirts",
-    "u-tees",
-    "u-tanks",
-    "u-case-iphone",
-    "u-case-samsung",
-    "all-stickers",
-    "u-print-board-gallery",
-    "u-print-art",
-    "u-print-canvas",
-    "u-print-frame",
-    "u-print-photo",
-    "u-print-poster",
-    "u-block-acrylic",
-    "u-apron",
-    "u-bath-mat",
-    "u-bedding",
-    "u-clock",
-    "u-coasters",
-    "u-die-cut-magnet",
-    "u-mugs",
-    "u-pillows",
-    "u-shower-curtain",
-    "u-print-tapestry",
-    "u-card-greeting",
-    "u-notebook-hardcover",
-    "all-mouse-pads",
-    "u-card-post",
-    "u-notebook-spiral",
-    "u-backpack",
-    "u-bag-drawstring",
-    "u-duffle-bag",
-    "all-hats",
-    "u-pin-button",
-    "w-scarf",
-    "u-tech-accessories",
-    "all-totes",
-    "u-bag-studiopouch",
-]
-
-EXPLORE_URL = f"https://www.redbubble.com/people/{SHOP_USER}/explore?asc=u&page={{page}}&sortOrder=recent"
-LISTING_URL = (
-    f"https://www.redbubble.com/people/{SHOP_USER}/shop"
-    f"?artistUserName={SHOP_USER}&asc=u&sortOrder=recent&page={{page}}&iaCode={{ia}}"
-)
+MAX_RETRIES = 2
+SLEEP_BETWEEN_REQUESTS_SEC = 1.2
 
 # Repo structure
 DATA_DIR = Path("data")
@@ -88,19 +49,22 @@ DEBUG_DIR = Path("debug")
 
 URL_POOL_JSON = DATA_DIR / "url_pool.json"
 USED_URLS_JSON = DATA_DIR / "used_urls.json"
+DESIGN_IDS_JSON = DATA_DIR / "design_ids.json"
 STATE_JSON = DATA_DIR / "state.json"
 
-SEED_URLS_TXT = DATA_DIR / "seed_urls.txt"  # hier fügst du neue /i/ URLs ein
 OUT_SITEMAP = PUBLIC_DIR / "sitemap.xml"
 
 
 # =========================
-# URL / Pattern Helpers
+# Patterns
 # =========================
-# /i/<product>/<slug>/<id>  (manchmal id.<track>)
 ID_RE_I = re.compile(r"/i/[^\"'\s<>]+/(\d+)(?:[/?#\.\"'\s<>]|$)")
-ID_RE_AP = re.compile(r"/shop/ap/(\d+)")
+ID_RE_AP = re.compile(r"/shop/ap/(\d+)(?:[/?#]|$)")
 
+
+# =========================
+# FS helpers
+# =========================
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -112,14 +76,31 @@ def debug_write(name: str, content: str) -> None:
     (DEBUG_DIR / name).write_text(content, encoding="utf-8", errors="ignore")
 
 
+def load_json(path: Path, default: dict) -> dict:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json(path: Path, obj: dict) -> None:
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+# =========================
+# URL normalize + filters
+# =========================
 def normalize_rb_url(url: str) -> str | None:
     """
     Normalisiert auf https://www.redbubble.com/<path>
-    Filtert alles raus, was keine Produktseite ist.
+    Erlaubt nur:
+      - /i/... (Produktseite)
+      - /shop/ap/<id> (Designseite, optional)
     """
     if not url:
         return None
-
     u = url.strip()
     if not u:
         return None
@@ -139,9 +120,6 @@ def normalize_rb_url(url: str) -> str | None:
         return None
 
     path = p.path or ""
-    # Erlaubt:
-    # - /i/...
-    # - optional /shop/ap/...
     if path.startswith("/i/"):
         pass
     elif path.startswith("/shop/ap/"):
@@ -155,67 +133,25 @@ def normalize_rb_url(url: str) -> str | None:
 
 def is_i_url(url: str) -> bool:
     try:
-        p = urlparse(url)
-        return (p.path or "").startswith("/i/")
+        return (urlparse(url).path or "").startswith("/i/")
     except Exception:
         return False
 
 
-def extract_product_urls_from_html(html: str) -> list[str]:
-    """
-    Extrahiert Produktseiten-URLs aus HTML:
-    - /i/...
-    - optional /shop/ap/...
-    """
-    out: list[str] = []
-    try:
-        soup = BeautifulSoup(html, "lxml")
-        for a in soup.find_all("a", href=True):
-            href = a.get("href")
-            if not isinstance(href, str):
-                continue
-            nu = normalize_rb_url(href)
-            if nu:
-                out.append(nu)
-    except Exception:
-        pass
-
-    # Dedupe order-preserving
-    seen = set()
-    dedup: list[str] = []
-    for u in out:
-        if u not in seen:
-            seen.add(u)
-            dedup.append(u)
-    return dedup
+def extract_design_id_from_url(url: str) -> str | None:
+    m = ID_RE_I.search(url)
+    if m:
+        return m.group(1)
+    m = ID_RE_AP.search(url)
+    if m:
+        return m.group(1)
+    return None
 
 
 # =========================
-# JSON storage
+# Pool: urls
 # =========================
-def load_json(path: Path, default: dict) -> dict:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-def save_json(path: Path, obj: dict) -> None:
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
 def pool_add_urls(urls: list[str], source: str) -> int:
-    """
-    data/url_pool.json:
-    {
-      "urls": {
-        "<url>": {"first_seen": "...", "last_seen": "...", "source": "...", "id": "123"}
-      },
-      "meta": {...}
-    }
-    """
     now = datetime.now(timezone.utc).isoformat()
     data = load_json(URL_POOL_JSON, {"urls": {}, "meta": {}})
     urls_map = data.get("urls", {})
@@ -228,10 +164,7 @@ def pool_add_urls(urls: list[str], source: str) -> int:
         if not nu:
             continue
 
-        pid = None
-        m = ID_RE_I.search(nu) or ID_RE_AP.search(nu)
-        if m:
-            pid = m.group(1)
+        pid = extract_design_id_from_url(nu)
 
         if nu not in urls_map:
             urls_map[nu] = {"first_seen": now, "last_seen": now, "source": source, "id": pid}
@@ -255,6 +188,9 @@ def load_pool_urls() -> list[str]:
     return list(urls_map.keys())
 
 
+# =========================
+# used urls
+# =========================
 def load_used_urls() -> set[str]:
     data = load_json(USED_URLS_JSON, {"used": [], "last_reset": None})
     used = data.get("used", [])
@@ -268,7 +204,45 @@ def save_used_urls(used: set[str], last_reset: str | None = None) -> None:
 
 
 # =========================
-# Rotation
+# design ids store
+# =========================
+def ids_add(ids: list[str], source: str) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    data = load_json(DESIGN_IDS_JSON, {"ids": {}, "meta": {}})
+    ids_map = data.get("ids", {})
+    if not isinstance(ids_map, dict):
+        ids_map = {}
+
+    added = 0
+    for pid in ids:
+        if not pid or not pid.isdigit():
+            continue
+        if pid not in ids_map:
+            ids_map[pid] = {"first_seen": now, "last_seen": now, "source": source}
+            added += 1
+        else:
+            if isinstance(ids_map[pid], dict):
+                ids_map[pid]["last_seen"] = now
+
+    data["ids"] = ids_map
+    data.setdefault("meta", {})
+    data["meta"]["updated_at"] = now
+    save_json(DESIGN_IDS_JSON, data)
+    return added
+
+
+def load_all_ids() -> list[str]:
+    data = load_json(DESIGN_IDS_JSON, {"ids": {}})
+    ids_map = data.get("ids", {})
+    if not isinstance(ids_map, dict):
+        return []
+    ids = [k for k in ids_map.keys() if isinstance(k, str) and k.isdigit()]
+    ids.sort()
+    return ids
+
+
+# =========================
+# Rotation + sitemap
 # =========================
 def pick_rotating_urls(all_urls: list[str], used: set[str], target: int) -> tuple[list[str], set[str], bool]:
     if not all_urls:
@@ -310,7 +284,7 @@ def write_sitemap(urls: list[str]) -> None:
 
 
 # =========================
-# Seed import (every run)
+# Seed import (EVERY run)
 # =========================
 def load_seed_urls() -> list[str]:
     if not SEED_URLS_TXT.exists():
@@ -337,9 +311,9 @@ def load_seed_urls() -> list[str]:
 
 
 # =========================
-# Discovery (best effort)
+# Requests discovery (best effort)
 # =========================
-def session() -> requests.Session:
+def requests_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(
         {
@@ -363,15 +337,7 @@ def looks_blocked(status: int, html: str) -> bool:
     if status in (403, 429):
         return True
     low = (html or "").lower()
-    needles = [
-        "attention required",
-        "verify you are human",
-        "captcha",
-        "cloudflare",
-        "/cdn-cgi/",
-        "access denied",
-        "request blocked",
-    ]
+    needles = ["verify you are human", "captcha", "cloudflare", "/cdn-cgi/", "access denied", "request blocked"]
     return any(n in low for n in needles)
 
 
@@ -381,98 +347,210 @@ def fetch_html(s: requests.Session, url: str, debug_name: str) -> str | None:
         try:
             r = s.get(url, timeout=REQUEST_TIMEOUT_SEC, allow_redirects=True)
             text = r.text or ""
-
             if looks_blocked(r.status_code, text) or not text.strip():
                 debug_write(f"{debug_name}_blocked_status{r.status_code}.html", text)
                 return None
-
             if r.status_code >= 400:
                 last_err = f"HTTP {r.status_code}"
-                time.sleep(1.5 * attempt)
+                time.sleep(1.0 * attempt)
                 continue
-
-            if debug_name.endswith("_p1"):
-                debug_write(f"{debug_name}.html", text)
-
             return text
         except Exception as e:
             last_err = str(e)
-            time.sleep(1.5 * attempt)
+            time.sleep(1.0 * attempt)
 
     if last_err:
         debug_write(f"{debug_name}_error.txt", last_err)
     return None
 
 
-def choose_ia_codes_for_run() -> list[str]:
-    ia = sorted(set(IA_CODES))
-    if not ia:
-        return []
-    st = load_json(STATE_JSON, {"ia_cursor": 0})
-    cursor = int(st.get("ia_cursor", 0)) if str(st.get("ia_cursor", "0")).isdigit() else 0
+def extract_urls_from_html(html: str) -> list[str]:
+    out: list[str] = []
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.find_all("a", href=True):
+            href = a.get("href")
+            if isinstance(href, str):
+                nu = normalize_rb_url(href)
+                if nu:
+                    out.append(nu)
+    except Exception:
+        pass
 
-    k = min(MAX_IA_CODES_PER_DISCOVERY_RUN, len(ia))
-    chosen = [ia[(cursor + i) % len(ia)] for i in range(k)]
-    st["ia_cursor"] = (cursor + k) % len(ia)
-    save_json(STATE_JSON, st)
-    return chosen
+    if ONLY_I_URLS:
+        out = [u for u in out if is_i_url(u)]
+
+    # dedupe
+    seen = set()
+    dedup = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            dedup.append(u)
+    return dedup
 
 
-def discover_urls() -> tuple[list[str], bool]:
-    s = session()
+def discover_with_requests() -> tuple[list[str], bool]:
+    s = requests_session()
     found: list[str] = []
     blocked_any = False
 
-    # Explore
     for p in range(1, EXPLORE_PAGES_TO_SCAN + 1):
-        url = EXPLORE_URL.format(page=p)
-        html = fetch_html(s, url, debug_name=f"explore_p{p}")
+        url = f"https://www.redbubble.com/people/{SHOP_USER}/explore?asc=u&page={p}&sortOrder=recent"
+        html = fetch_html(s, url, debug_name=f"req_explore_p{p}")
         if html is None:
-            print(f"WARN: blocked/empty explore page={p}")
+            print(f"WARN: requests blocked/empty explore page={p}")
             blocked_any = True
             break
-
-        urls = extract_product_urls_from_html(html)
-        # Filter: wenn ONLY_I_URLS -> nur /i/
-        if ONLY_I_URLS:
-            urls = [u for u in urls if is_i_url(u)]
-
+        urls = extract_urls_from_html(html)
         if not urls:
-            print(f"INFO: no product urls on explore page={p}")
             break
-
         found.extend(urls)
         time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
 
-    # Listing by IA codes
-    for ia in choose_ia_codes_for_run():
-        for p in range(1, LISTING_PAGES_PER_CATEGORY_TO_SCAN + 1):
-            url = LISTING_URL.format(page=p, ia=ia)
-            html = fetch_html(s, url, debug_name=f"listing_{ia}_p{p}")
-            if html is None:
-                print(f"WARN: blocked/empty ia={ia} page={p}")
-                blocked_any = True
-                break
+    return found, blocked_any
 
-            urls = extract_product_urls_from_html(html)
-            if ONLY_I_URLS:
-                urls = [u for u in urls if is_i_url(u)]
 
-            if not urls:
-                print(f"INFO: no product urls ia={ia} page={p}")
-                break
+# =========================
+# Playwright discovery (from /shop/ap/<id> -> collect many /i/ links)
+# =========================
+def load_state() -> dict:
+    return load_json(STATE_JSON, {"pw_id_cursor": 0})
 
-            found.extend(urls)
-            time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
 
-    # Dedupe order-preserving
-    seen = set()
-    out = []
-    for u in found:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out, blocked_any
+def save_state(st: dict) -> None:
+    save_json(STATE_JSON, st)
+
+
+def sleep_random() -> None:
+    time.sleep(random.uniform(PW_SLEEP_MIN, PW_SLEEP_MAX))
+
+
+def pw_collect_i_urls_for_design(context, design_id: str) -> list[str]:
+    """
+    Open /shop/ap/<id>, collect all /i/ product links visible in DOM.
+    """
+    url = f"https://www.redbubble.com/shop/ap/{design_id}"
+    page = context.new_page()
+
+    try:
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        status = resp.status if resp else None
+
+        # kleine Wartezeit damit Elemente rendern
+        page.wait_for_timeout(1500)
+
+        html = page.content()
+        if html and ("captcha" in html.lower() or "verify you are human" in html.lower() or "/cdn-cgi/" in html.lower()):
+            debug_write(f"pw_ap_{design_id}_blocked.html", html)
+            return []
+
+        if status in (403, 429):
+            debug_write(f"pw_ap_{design_id}_status{status}.html", html or "")
+            return []
+
+        # Links sammeln
+        hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.getAttribute('href'))")
+        urls: list[str] = []
+        for h in hrefs:
+            if isinstance(h, str) and "/i/" in h:
+                nu = normalize_rb_url(h)
+                if nu and is_i_url(nu):
+                    urls.append(nu)
+
+        # dedupe
+        seen = set()
+        dedup = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                dedup.append(u)
+
+        # Optional Debug bei leeren Ergebnissen
+        if not dedup:
+            debug_write(f"pw_ap_{design_id}_no_i_links.html", html or "")
+
+        return dedup
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+def discover_with_playwright(headless: bool, per_run: int) -> tuple[int, int]:
+    """
+    Returns (designs_processed, urls_added_total)
+    """
+    ensure_dirs()
+
+    # IDs aus DESIGN_IDS_JSON
+    all_ids = load_all_ids()
+    if not all_ids:
+        print("INFO: no design IDs available for Playwright discovery (seed some /i/ URLs first).")
+        return 0, 0
+
+    st = load_state()
+    cursor = int(st.get("pw_id_cursor", 0)) if str(st.get("pw_id_cursor", "0")).isdigit() else 0
+
+    batch = []
+    for i in range(per_run):
+        batch.append(all_ids[(cursor + i) % len(all_ids)])
+
+    new_cursor = (cursor + len(batch)) % len(all_ids)
+
+    urls_added_total = 0
+
+    with sync_playwright() as p:
+        # Chromium ist meistens stabil. Du kannst auch p.chromium.launch(channel="msedge") probieren,
+        # aber channel ist nicht überall verfügbar.
+        browser = p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+
+        # Persistent Profil (Cookies/Storage) unter data/pw_profile
+        user_data_dir = str((DATA_DIR / "pw_profile").resolve())
+
+        # Leider unterstützt sync_playwright persistent context direkt über launch_persistent_context:
+        browser.close()
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=headless,
+            locale="en-US",
+            timezone_id="Europe/Berlin",
+            viewport={"width": 1280, "height": 720},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+        )
+
+        try:
+            for did in batch:
+                urls = pw_collect_i_urls_for_design(context, did)
+                if urls:
+                    added = pool_add_urls(urls, source="pw_from_shop_ap")
+                    urls_added_total += added
+                    print(f"PW: design {did} -> found {len(urls)} /i/ links | added_new={added}")
+                else:
+                    print(f"PW: design {did} -> no /i/ links (maybe blocked or not rendered)")
+
+                sleep_random()
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+    st["pw_id_cursor"] = new_cursor
+    save_state(st)
+
+    return len(batch), urls_added_total
 
 
 # =========================
@@ -482,65 +560,80 @@ def main() -> int:
     ensure_dirs()
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--discover", action="store_true", help="Try to discover new /i/ URLs (best effort)")
-    ap.add_argument("--build", action="store_true", help="Build sitemap.xml from pool")
+    ap.add_argument("--build", action="store_true")
+    ap.add_argument("--discover-requests", action="store_true")
+    ap.add_argument("--discover-playwright", action="store_true")
     ap.add_argument("--target", type=int, default=TARGET_URLS_DEFAULT)
+    ap.add_argument("--pw-per-run", type=int, default=PW_DESIGNS_PER_RUN)
+    ap.add_argument("--pw-headful", action="store_true")  # falls du mal interaktiv testen willst
     args = ap.parse_args()
 
-    # Default: do build (and not discover) unless requested
-    run_discover = args.discover
-    run_build = args.build or (not args.discover and not args.build)
+    run_build = args.build or (not args.build and not args.discover_requests and not args.discover_playwright)
 
-    # 0) Seed import EVERY run
+    # 0) Seed import every run
     seed_urls = load_seed_urls()
     if seed_urls:
         added = pool_add_urls(seed_urls, source="seed_urls")
-        print(f"OK: imported seed_urls.txt | urls_in_file={len(seed_urls)} | added_new={added}")
+        seed_ids = [extract_design_id_from_url(u) for u in seed_urls]
+        seed_ids = [x for x in seed_ids if x and x.isdigit()]
+        ids_added = ids_add(seed_ids, source="seed_urls")
+        print(f"OK: imported seed_urls.txt | urls_in_file={len(seed_urls)} | added_urls={added} | added_ids={ids_added}")
     else:
         print("INFO: seed_urls.txt empty or missing (no seed import)")
 
-    # 1) Discovery (optional)
-    if run_discover:
-        new_urls, blocked_any = discover_urls()
-        if new_urls:
-            added = pool_add_urls(new_urls, source="auto_discovery")
-            print(f"OK: discovery found={len(new_urls)} | added_new={added}")
-        else:
-            print("WARN: discovery returned 0 URLs.")
-            if blocked_any:
-                print("WARN: looks blocked/empty. Check debug/*.html")
+    # Also IDs aus vorhandenem URL pool ableiten (damit Playwright was hat)
+    pool = load_pool_urls()
+    pool_ids = []
+    for u in pool:
+        pid = extract_design_id_from_url(u)
+        if pid and pid.isdigit():
+            pool_ids.append(pid)
+    ids_add(pool_ids, source="from_url_pool")
 
-    # 2) Build sitemap
+    # 1) Requests discovery optional
+    if args.discover_requests:
+        urls, blocked = discover_with_requests()
+        if urls:
+            added = pool_add_urls(urls, source="req_discovery")
+            ids = [extract_design_id_from_url(u) for u in urls]
+            ids = [x for x in ids if x and x.isdigit()]
+            ids_added = ids_add(ids, source="req_discovery")
+            print(f"OK: requests discovery found={len(urls)} | added_urls={added} | added_ids={ids_added}")
+        else:
+            print("WARN: requests discovery found 0 URLs.")
+            if blocked:
+                print("WARN: requests looked blocked. Check debug/req_explore_*.html")
+
+    # 2) Playwright discovery optional (beste Chance für “mehr Produkte je Design”)
+    if args.discover_playwright:
+        headless = (not args.pw_headful) and PW_HEADLESS_DEFAULT
+        processed, urls_added = discover_with_playwright(headless=headless, per_run=args.pw_per_run)
+        print(f"OK: playwright processed_designs={processed} | urls_added_new={urls_added}")
+
+    # 3) Build sitemap
     if run_build:
         pool = load_pool_urls()
         used = load_used_urls()
 
+        # Filter: wenn ONLY_I_URLS True, sicherstellen dass nur /i/ im Pool genutzt wird
+        if ONLY_I_URLS:
+            pool = [u for u in pool if is_i_url(u)]
+
         if not pool:
-            # If sitemap already exists, keep it
             if OUT_SITEMAP.exists() and OUT_SITEMAP.stat().st_size > 200:
-                print("WARN: url pool empty, but sitemap exists -> keeping existing sitemap.xml (exit 0).")
+                print("WARN: pool empty but sitemap exists -> keep existing sitemap.xml (exit 0)")
                 return 0
-            print("ERROR: url pool empty AND no existing sitemap.xml. Add /i/ URLs to data/seed_urls.txt.")
+            print("ERROR: pool empty AND no sitemap exists. Add /i/ URLs to data/seed_urls.txt")
             return 1
 
-        # Effective target: nicht größer als Pool
         effective_target = min(args.target, len(pool))
-
         picked, used, did_reset = pick_rotating_urls(pool, used, effective_target)
-        if not picked:
-            if OUT_SITEMAP.exists() and OUT_SITEMAP.stat().st_size > 200:
-                print("WARN: could not pick urls, keeping existing sitemap.xml (exit 0).")
-                return 0
-            print("ERROR: could not pick any urls.")
-            return 1
 
         write_sitemap(picked)
-
         reset_ts = datetime.now(timezone.utc).isoformat() if did_reset else load_json(USED_URLS_JSON, {"last_reset": None}).get("last_reset")
         save_used_urls(used, last_reset=reset_ts)
 
-        print(f"OK: wrote {len(picked)} product URLs to {OUT_SITEMAP}")
-        print(f"INFO: pool_size={len(pool)} | used_size={len(used)} | only_i_urls={ONLY_I_URLS}")
+        print(f"OK: wrote {len(picked)} URLs to {OUT_SITEMAP} | pool_size={len(pool)} | only_i={ONLY_I_URLS}")
         return 0
 
     return 0
