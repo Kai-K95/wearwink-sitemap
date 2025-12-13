@@ -14,7 +14,7 @@ jobs:
 
     defaults:
       run:
-        shell: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        shell: pwsh
 
     steps:
       - uses: actions/checkout@v4
@@ -53,15 +53,13 @@ jobs:
         run: |
           if ($env:PY -like "py*") {
             py -3.11 -m venv .venv
-            .\.venv\Scripts\python -m pip install --upgrade pip
-            .\.venv\Scripts\pip install -r requirements.txt
-            .\.venv\Scripts\python -m playwright install chromium
           } else {
             & $env:PY -m venv .venv
-            .\.venv\Scripts\python -m pip install --upgrade pip
-            .\.venv\Scripts\pip install -r requirements.txt
-            .\.venv\Scripts\python -m playwright install chromium
           }
+
+          .\.venv\Scripts\python -m pip install --upgrade pip
+          .\.venv\Scripts\pip install -r requirements.txt
+          .\.venv\Scripts\python -m playwright install chromium
 
       - name: Generate sitemap
         run: |
