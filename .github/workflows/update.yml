@@ -1,105 +1,81 @@
 name: Update sitemap
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 3 * * *"
+    # täglich 03:30 Uhr UTC (in DE meist 04:30/05:30 je nach DST)
+    - cron: "30 3 * * *"
 
 permissions:
   contents: write
+
+concurrency:
+  group: sitemap-update
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: powershell
 
 jobs:
   build:
     runs-on: [self-hosted, Windows, X64]
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: PowerShell info
-        shell: powershell
+      - name: Environment sanity
         run: |
-          $PSVersionTable
+          Write-Host "=== SANITY ==="
+          Write-Host "User: $env:USERNAME"
+          Write-Host "Machine: $env:COMPUTERNAME"
+          Write-Host "PATH: $env:PATH"
 
-      - name: Resolve Python
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "`n--- pwsh ---"
+          where pwsh
+          pwsh -v
 
-          # Kandidaten, die auch als Service-User funktionieren (wenn Python "all users" installiert ist)
-          $candidates = @(
-            "C:\Program Files\Python311\python.exe",
-            "C:\Program Files (x86)\Python311\python.exe",
-            "C:\Python311\python.exe",
-            "C:\Windows\py.exe"
-          )
+          Write-Host "`n--- python ---"
+          where python
+          python --version
+          python -m pip --version
 
-          $py = $null
-
-          foreach ($c in $candidates) {
-            if (Test-Path $c) { $py = $c; break }
-          }
-
-          # Fallback: python.exe aus PATH (falls vorhanden)
-          if (-not $py) {
-            $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
-            if ($cmd) { $py = $cmd.Source }
-          }
-
-          if (-not $py) {
-            throw "Python not found for runner service user. Install Python for ALL users to C:\Program Files\Python311 or add it to MACHINE PATH."
-          }
-
-          "PY=$py" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          Write-Host "Using: $py"
-          & $py --version
-
-          # Wenn wir py.exe gefunden haben, prüfen ob Launcher wirklich Python findet
-          if ($py -like "*\py.exe") {
-            & $py -0p
-          } else {
-            & $py -m pip --version
-          }
+          Write-Host "`n--- git ---"
+          where git
+          git --version
 
       - name: Create venv + install deps
-        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "=== VENV + DEPS ==="
+          python -m venv .venv
 
-          # Wenn $env:PY auf py.exe zeigt, benutzen wir direkt python aus Program Files lieber:
-          if ($env:PY -like "*\py.exe") {
-            # Versuch: python direkt via PATH
-            $pythonCmd = Get-Command python.exe -ErrorAction SilentlyContinue
-            if (-not $pythonCmd) { throw "py.exe exists but python.exe not found. Install Python for ALL users." }
-            $PYTHON = $pythonCmd.Source
-          } else {
-            $PYTHON = $env:PY
-          }
-
-          & $PYTHON -m venv .venv
+          # venv-Python direkt benutzen (ohne Activate.ps1 -> keine Policy-Probleme)
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
       - name: Generate sitemap
-        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "=== GENERATE SITEMAP ==="
           .\.venv\Scripts\python.exe generate_sitemap.py
 
-      - name: Commit changes
-        shell: powershell
+      - name: Commit changes (if any)
         run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "=== COMMIT ==="
+          git status --porcelain
+
+          $changes = (git status --porcelain)
+          if (-not $changes) {
+            Write-Host "No changes to commit."
+            exit 0
+          }
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add sitemap.xml last_count.txt urls.txt debug_page1.html debug_page1.png 2>$null
-
-          git diff --cached --quiet
-          if ($LASTEXITCODE -ne 0) {
-            git commit -m "Update sitemap"
-            git push
-          } else {
-            Write-Host "No changes to commit."
-          }
+          git add -A
+          git commit -m "Update sitemap"
+          git push
