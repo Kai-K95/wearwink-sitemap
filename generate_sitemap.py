@@ -1,221 +1,234 @@
+from __future__ import annotations
+
+import os
 import re
+import time
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from xml.sax.saxutils import escape as xml_escape
+from typing import Iterable, List, Set
 
-from playwright.sync_api import sync_playwright
+import requests
+from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
+
 
 # =========================
-# SETTINGS
+# CONFIG
 # =========================
-ARTIST = "WearWink"
-BASE = "https://www.redbubble.com"
+USERNAME = "WearWink"
 
-EXPLORE_URL = f"{BASE}/people/{ARTIST}/explore?asc=u&page={{page}}&sortOrder=recent"
+# Wieviele Produkt-URLs sollen in der sitemap stehen (rotierend pro Tag)?
+TOTAL_URLS = 1100
 
-EXPLORE_PAGES_TO_SCAN = 10          # wie viele "Designs entdecken" Seiten scannen
-MAX_DESIGNS_TO_VISIT = 160          # wie viele /shop/ap/ Seiten besuchen
-TARGET_I_URLS_PER_DAY = 1100        # dein Ziel
-MAX_POOL_SIZE = 20000               # Sicherheitslimit
+# Wie viele Listing-Seiten versuchen wir zum IDs sammeln? (niedrig halten -> weniger Risiko geblockt zu werden)
+DISCOVERY_PAGES = 25
 
-GOTO_TIMEOUT_MS = 60_000
-SLEEP_SEC = 0.5
+# Wartezeit zwischen Requests
+SLEEP_SECONDS = 1.2
 
+# Dateien (im Repo-Root)
 OUT_SITEMAP = Path("sitemap.xml")
-OUT_COUNT = Path("last_count.txt")
-OUT_URLS = Path("urls.txt")
+OUT_URLS_TXT = Path("urls.txt")
+OUT_LAST_COUNT = Path("last_count.txt")
+CACHE_IDS = Path("design_ids.txt")
 
-USED_URLS = Path("used_urls.txt")            # damit URLs nicht ständig wiederkommen
-DESIGN_CACHE = Path("design_ids_cache.txt")  # Fallback, falls Explore mal leer/blocked
-
-DEBUG_EXPLORE = Path("debug_explore.html")
-DEBUG_DESIGN = Path("debug_design.html")
-
-# =========================
-# REGEX
-# =========================
+# Patterns
 DESIGN_ID_RE = re.compile(r"/shop/ap/(\d+)", re.IGNORECASE)
-I_URL_RE = re.compile(r"^https://www\.redbubble\.com/(?:[a-z]{2}/)?i/[^\"<>\s]+$", re.IGNORECASE)
 
-BLOCK_MARKERS = (
-    "cloudflare",
-    "verify you are human",
-    "checking your browser",
-    "attention required",
-    "captcha",
-    "bestätigen sie, dass sie ein mensch sind",
-)
+# Candidate listing pages to find /shop/ap/<id> links
+LISTING_URL_TEMPLATES = [
+    # Explore (oft gut zum "neueste")
+    "https://www.redbubble.com/people/{u}/explore?asc=u&page={p}&sortOrder=recent",
+    # Shop listing
+    "https://www.redbubble.com/people/{u}/shop?artistUserName={u}&asc=u&page={p}&sortOrder=recent",
+]
 
-def normalize_url(u: str) -> str:
-    u = u.strip()
-    u = u.replace("http://", "https://")
-    u = u.replace("https://www.redbubble.com/de/", "https://www.redbubble.com/")
-    u = u.replace("https://www.redbubble.com/en/", "https://www.redbubble.com/")
-    return u
 
-def is_blocked(html: str) -> bool:
-    h = html.lower()
-    return any(m in h for m in BLOCK_MARKERS)
+def _today_seed() -> int:
+    # tägliche Rotation: deterministische “Zufalls”-Reihenfolge pro Tag
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    h = hashlib.sha256(day.encode("utf-8")).hexdigest()
+    return int(h[:16], 16)
 
-def today_seed() -> int:
-    # deterministisch “zufällig” pro Tag
-    s = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return int(hashlib.sha256(s.encode("utf-8")).hexdigest()[:12], 16)
 
-def read_lines(p: Path) -> list[str]:
-    if not p.exists():
-        return []
-    return [x.strip() for x in p.read_text(encoding="utf-8", errors="ignore").splitlines() if x.strip()]
+def _headers() -> dict:
+    # “normale” Browser-Header (keine Umgehungs-Tricks)
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+    }
 
-def write_lines(p: Path, lines: list[str]) -> None:
-    p.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
-def unique_keep_order(items: list[str]) -> list[str]:
-    seen = set()
-    out = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+def fetch_html(session: requests.Session, url: str, timeout: int = 30) -> tuple[int, str]:
+    r = session.get(url, headers=_headers(), timeout=timeout, allow_redirects=True)
+    return r.status_code, r.text or ""
 
-def write_sitemap(urls: list[str]) -> None:
-    lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
-    ]
-    for u in urls:
-        loc = xml_escape(u, {"'": "&apos;", '"': "&quot;"})
-        lines.append("  <url>")
-        lines.append(f"    <loc>{loc}</loc>")
-        lines.append(f"    <lastmod>{lastmod}</lastmod>")
-        lines.append("  </url>")
-    lines.append("</urlset>")
-    OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-def extract_design_ids_from_page_links(links: list[str]) -> list[str]:
-    ids = []
-    for href in links:
+def looks_blocked(status: int, html: str) -> bool:
+    # grobe Heuristik: 403/429/503 oder typische Block-Seiten
+    if status in (403, 429, 503):
+        return True
+    low = (html or "").lower()
+    if "cloudflare" in low and ("attention required" in low or "checking your browser" in low):
+        return True
+    if "access denied" in low or "request blocked" in low:
+        return True
+    return False
+
+
+def extract_design_ids(html: str) -> List[str]:
+    # 1) schnell per regex
+    ids = DESIGN_ID_RE.findall(html or "")
+    if ids:
+        # unique, stable order
+        out = []
+        seen = set()
+        for i in ids:
+            if i not in seen:
+                seen.add(i)
+                out.append(i)
+        return out
+
+    # 2) fallback: bs4 links durchsuchen
+    soup = BeautifulSoup(html or "", "lxml")
+    out: List[str] = []
+    seen: Set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
         m = DESIGN_ID_RE.search(href)
         if m:
-            ids.append(m.group(1))
-    return unique_keep_order(ids)
+            did = m.group(1)
+            if did not in seen:
+                seen.add(did)
+                out.append(did)
+    return out
 
-def pick_rotating(pool: list[str], used: set[str], k: int) -> list[str]:
-    if not pool:
+
+def load_cached_ids() -> List[str]:
+    if not CACHE_IDS.exists():
         return []
+    ids = []
+    for line in CACHE_IDS.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.isdigit():
+            ids.append(line)
+    # unique
+    out = []
+    seen = set()
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
 
-    # zuerst neue URLs, sonst recycle
-    fresh = [u for u in pool if u not in used]
-    if len(fresh) < k:
-        used.clear()
-        fresh = pool[:]
 
-    # tägliche Rotation (deterministisch)
-    fresh_sorted = sorted(fresh)
-    seed = today_seed()
-    start = seed % len(fresh_sorted)
-    rotated = fresh_sorted[start:] + fresh_sorted[:start]
-    return rotated[:k]
+def save_cached_ids(ids: Iterable[str]) -> None:
+    ids = list(ids)
+    CACHE_IDS.write_text("\n".join(ids) + ("\n" if ids else ""), encoding="utf-8")
 
-def main() -> None:
-    used_set = set(read_lines(USED_URLS))
-    cached_designs = read_lines(DESIGN_CACHE)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+def discover_ids() -> tuple[List[str], bool]:
+    """
+    Returns: (ids, blocked_flag)
+    """
+    session = requests.Session()
+    found: List[str] = []
+    seen: Set[str] = set()
+    blocked_any = False
 
-        # 1) Explore -> Design IDs
-        design_ids: list[str] = []
-        for i in range(1, EXPLORE_PAGES_TO_SCAN + 1):
-            url = EXPLORE_URL.format(page=i)
-            page.goto(url, wait_until="networkidle", timeout=GOTO_TIMEOUT_MS)
-            html = page.content()
-
-            if i == 1:
-                DEBUG_EXPLORE.write_text(html, encoding="utf-8")
-
-            if is_blocked(html):
-                print(f"BLOCKED: explore page {i}")
-                design_ids = []
-                break
-
-            links = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-            ids = extract_design_ids_from_page_links(links)
-            if ids:
-                design_ids.extend(ids)
-
-            design_ids = unique_keep_order(design_ids)
-            print(f"explore {i}: total design ids = {len(design_ids)}")
-
-            if len(design_ids) >= MAX_DESIGNS_TO_VISIT:
-                break
-
-        # Fallback cache
-        if not design_ids and cached_designs:
-            print("Using cached design IDs (explore empty/blocked)")
-            design_ids = cached_designs[:MAX_DESIGNS_TO_VISIT]
-
-        if not design_ids:
-            browser.close()
-            raise SystemExit("❌ No design IDs found (explore blocked and cache empty).")
-
-        write_lines(DESIGN_CACHE, design_ids)
-
-        # 2) Für jedes Design: /shop/ap/<id> -> /i/ URLs sammeln
-        pool_set: set[str] = set()
-        for idx, did in enumerate(design_ids[:MAX_DESIGNS_TO_VISIT], start=1):
-            durl = f"{BASE}/shop/ap/{did}"
-            page.goto(durl, wait_until="networkidle", timeout=GOTO_TIMEOUT_MS)
-            html = page.content()
-
-            if idx == 1:
-                DEBUG_DESIGN.write_text(html, encoding="utf-8")
-
-            if is_blocked(html):
-                print(f"BLOCKED: ap/{did}")
+    for p in range(1, DISCOVERY_PAGES + 1):
+        for tmpl in LISTING_URL_TEMPLATES:
+            url = tmpl.format(u=USERNAME, p=p)
+            try:
+                status, html = fetch_html(session, url)
+            except Exception:
                 continue
 
-            links = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-            added = 0
-            for href in links:
-                href = normalize_url(href)
-                if I_URL_RE.match(href):
-                    if href not in pool_set:
-                        pool_set.add(href)
-                        added += 1
+            if looks_blocked(status, html):
+                blocked_any = True
+                continue
 
-            print(f"ap {idx}/{min(len(design_ids), MAX_DESIGNS_TO_VISIT)}: +{added} (pool={len(pool_set)})")
+            ids = extract_design_ids(html)
+            for did in ids:
+                if did not in seen:
+                    seen.add(did)
+                    found.append(did)
 
-            if len(pool_set) >= MAX_POOL_SIZE:
-                break
+            time.sleep(SLEEP_SECONDS)
 
-        browser.close()
+    return found, blocked_any
 
-    pool = sorted(pool_set)
-    if not pool:
-        raise SystemExit("❌ Pool is 0 (no /i/ URLs found).")
 
-    picked = pick_rotating(pool, used_set, TARGET_I_URLS_PER_DAY)
+def pick_rotating(ids: List[str], n: int) -> List[str]:
+    if not ids:
+        return []
 
-    # used updaten (damit keine Wiederholung, bis Pool “durch” ist)
-    for u in picked:
-        used_set.add(u)
-    used_list = sorted(used_set)
-    # limit file growth
-    if len(used_list) > 200000:
-        used_list = used_list[-200000:]
-    write_lines(USED_URLS, used_list)
+    # deterministisch shuffle per Tag
+    seed = _today_seed()
+    # einfacher deterministischer Shuffle: sort by hash(seed + id)
+    def key_fn(did: str) -> str:
+        h = hashlib.sha256(f"{seed}:{did}".encode("utf-8")).hexdigest()
+        return h
 
-    # Output
-    write_lines(OUT_URLS, picked)
-    write_sitemap(picked)
-    OUT_COUNT.write_text(str(len(picked)) + "\n", encoding="utf-8")
+    ordered = sorted(ids, key=key_fn)
+    return ordered[: min(n, len(ordered))]
 
-    print(f"✅ OK: wrote {len(picked)} /i/ URLs")
+
+def write_sitemap(urls: List[str]) -> None:
+    lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    urlset = ET.Element("urlset", attrib={"xmlns": "http://www.sitemaps.org/schemas/sitemap/0.9"})
+
+    for u in urls:
+        url_el = ET.SubElement(urlset, "url")
+        loc_el = ET.SubElement(url_el, "loc")
+        loc_el.text = u
+        lastmod_el = ET.SubElement(url_el, "lastmod")
+        lastmod_el.text = lastmod
+
+    tree = ET.ElementTree(urlset)
+    # XML declaration + UTF-8
+    tree.write(OUT_SITEMAP, encoding="utf-8", xml_declaration=True)
+
+
+def main() -> None:
+    cached = load_cached_ids()
+    newly_found, blocked = discover_ids()
+
+    # Merge cache + new
+    merged = []
+    seen = set()
+    for did in (newly_found + cached):
+        if did not in seen:
+            seen.add(did)
+            merged.append(did)
+
+    if not merged:
+        # Nichts da -> hart fail, damit du es siehst
+        raise SystemExit("❌ No design IDs available (cache empty + discovery failed/blocked).")
+
+    # Cache aktualisieren (auch wenn discovery teilweise geblockt war)
+    save_cached_ids(merged)
+
+    picked = pick_rotating(merged, TOTAL_URLS)
+
+    # -> /shop/ap/<id> (das sind “Produktseiten” die BTP normalerweise als Produkt/Artwork versteht)
+    urls = [f"https://www.redbubble.com/shop/ap/{did}" for did in picked]
+
+    write_sitemap(urls)
+    OUT_URLS_TXT.write_text("\n".join(urls) + "\n", encoding="utf-8")
+    OUT_LAST_COUNT.write_text(str(len(urls)) + "\n", encoding="utf-8")
+
+    msg = f"✅ wrote {len(urls)} URLs | ids_total={len(merged)} | blocked={blocked}"
+    print(msg)
+
 
 if __name__ == "__main__":
     main()
