@@ -14,22 +14,54 @@ jobs:
 
     defaults:
       run:
-        shell: powershell
+        shell: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Find Python (python.exe or py.exe)
+        run: |
+          $py = $null
+
+          $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
+          if ($cmd) { $py = $cmd.Source }
+
+          if (-not $py) {
+            $cmd2 = Get-Command py.exe -ErrorAction SilentlyContinue
+            if ($cmd2) { $py = "py -3.11" }
+          }
+
+          if (-not $py) {
+            Write-Host "❌ Python not found for the runner user. Install Python for ALL users or add it to PATH."
+            exit 1
+          }
+
+          "PY=$py" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "✅ Using: $py"
+
       - name: Python sanity check
         run: |
-          python --version
-          python -m pip --version
+          if ($env:PY -like "py*") {
+            py -3.11 --version
+            py -3.11 -m pip --version
+          } else {
+            & $env:PY --version
+            & $env:PY -m pip --version
+          }
 
       - name: Create venv + install deps
         run: |
-          python -m venv .venv
-          .\.venv\Scripts\python -m pip install --upgrade pip
-          .\.venv\Scripts\pip install -r requirements.txt
-          .\.venv\Scripts\python -m playwright install chromium
+          if ($env:PY -like "py*") {
+            py -3.11 -m venv .venv
+            .\.venv\Scripts\python -m pip install --upgrade pip
+            .\.venv\Scripts\pip install -r requirements.txt
+            .\.venv\Scripts\python -m playwright install chromium
+          } else {
+            & $env:PY -m venv .venv
+            .\.venv\Scripts\python -m pip install --upgrade pip
+            .\.venv\Scripts\pip install -r requirements.txt
+            .\.venv\Scripts\python -m playwright install chromium
+          }
 
       - name: Generate sitemap
         run: |
@@ -40,7 +72,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add sitemap.xml last_count.txt
+          git add sitemap.xml last_count.txt design_ids.txt urls.txt 2>$null
 
           git diff --cached --quiet
           if ($LASTEXITCODE -eq 0) {
