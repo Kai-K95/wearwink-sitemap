@@ -8,26 +8,23 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: wearwink-sitemap
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: [self-hosted, windows, x64]
-    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: powershell
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Python sanity check
-        shell: pwsh
         run: |
           python --version
           python -m pip --version
 
       - name: Create venv + install deps
-        shell: pwsh
         run: |
           python -m venv .venv
           .\.venv\Scripts\python -m pip install --upgrade pip
@@ -35,22 +32,21 @@ jobs:
           .\.venv\Scripts\python -m playwright install chromium
 
       - name: Generate sitemap
-        shell: pwsh
         run: |
           .\.venv\Scripts\python generate_sitemap.py
 
       - name: Commit changes
-        shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add sitemap.xml last_count.txt urls.txt used_urls.txt design_ids_cache.txt debug_*.html debug_*.png 2>$null
+          git add sitemap.xml last_count.txt
 
           git diff --cached --quiet
-          if ($LASTEXITCODE -ne 0) {
-            git commit -m "Update sitemap"
-            git push
-          } else {
+          if ($LASTEXITCODE -eq 0) {
             Write-Host "No changes to commit."
+            exit 0
           }
+
+          git commit -m "Update sitemap"
+          git push
