@@ -3,6 +3,7 @@ name: update
 on:
   workflow_dispatch:
   schedule:
+    # täglich (UTC)
     - cron: "17 3 * * *"
 
 permissions:
@@ -51,12 +52,12 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-      - name: Generate sitemap (build, fallback to discover if empty)
+      - name: Generate sitemap (build; try discover if build fails)
         shell: pwsh
         run: |
           .\.venv\Scripts\python.exe .\generate_sitemap.py --build --target 1100
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "Build failed. Trying discovery+build..."
+            Write-Host "Build failed. Trying discover+build..."
             .\.venv\Scripts\python.exe .\generate_sitemap.py --discover --build --target 1100
           }
 
@@ -86,7 +87,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add public/sitemap.xml data/*.json data/seed_urls.txt 2>$null
+          git add public/sitemap.xml data/url_pool.json data/used_urls.json data/state.json data/seed_urls.txt debug/* 2>$null
 
           if (git diff --cached --quiet) {
             Write-Host "No changes to commit."
