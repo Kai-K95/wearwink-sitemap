@@ -14,7 +14,7 @@ jobs:
 
     defaults:
       run:
-        shell: pwsh
+        shell: powershell
 
     steps:
       - uses: actions/checkout@v4
@@ -23,16 +23,31 @@ jobs:
         run: |
           $py = $null
 
+          # 1) In PATH?
           $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
           if ($cmd) { $py = $cmd.Source }
 
+          # 2) Python Launcher?
           if (-not $py) {
             $cmd2 = Get-Command py.exe -ErrorAction SilentlyContinue
             if ($cmd2) { $py = "py -3.11" }
           }
 
+          # 3) typische Install-Pfade (falls PATH fehlt)
           if (-not $py) {
-            Write-Host "❌ Python not found for the runner user. Install Python for ALL users or add it to PATH."
+            $candidates = @(
+              "C:\Python311\python.exe",
+              "C:\Program Files\Python311\python.exe",
+              "C:\Program Files (x86)\Python311\python.exe"
+            )
+            foreach ($c in $candidates) {
+              if (Test-Path $c) { $py = $c; break }
+            }
+          }
+
+          if (-not $py) {
+            Write-Host "❌ Python not found for the runner user (service account)."
+            Write-Host "➡️ Install Python for ALL users + add to MACHINE PATH, or hardcode the path."
             exit 1
           }
 
