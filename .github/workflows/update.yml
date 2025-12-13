@@ -8,15 +8,21 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: wearwink-sitemap
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: [self-hosted, windows, x64]
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -36,5 +42,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sitemap.xml last_count.txt used_urls.txt design_ids_cache.txt debug_*.html debug_*.png 2>$null
-          git diff --cached --quiet; if ($LASTEXITCODE -ne 0) { git commit -m "Update sitemap"; git push }
+          git add sitemap.xml last_count.txt urls.txt used_urls.txt design_ids_cache.txt debug_*.html debug_*.png 2>$null
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Update sitemap"
+            git push
+          }
