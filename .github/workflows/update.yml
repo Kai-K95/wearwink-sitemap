@@ -3,7 +3,6 @@ name: update
 on:
   workflow_dispatch:
   schedule:
-    # täglich (UTC)
     - cron: "17 3 * * *"
 
 permissions:
