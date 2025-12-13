@@ -18,13 +18,13 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Python sanity check
+        shell: pwsh
+        run: |
+          python --version
+          python -m pip --version
 
       - name: Install deps
         shell: pwsh
