@@ -49,10 +49,10 @@ jobs:
         run: |
           .\.venv\Scripts\python.exe -m playwright install chromium
 
-      - name: Generate sitemap (seed -> playwright discover -> build)
+      - name: Generate sitemap (seed -> playwright -> build)
         shell: pwsh
         run: |
-          .\.venv\Scripts\python.exe .\generate_sitemap.py --discover-playwright --pw-per-run 20 --build --target 1100
+          .\.venv\Scripts\python.exe .\generate_sitemap.py --discover-playwright --pw-per-run 10 --build --target 1100
 
       - name: Upload debug artifacts
         uses: actions/upload-artifact@v4
