@@ -15,16 +15,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Python sanity check
+      - name: Find Python
         shell: powershell
         run: |
-          py -3.11 --version
-          py -3.11 -m pip --version
+          $candidates = @(
+            "C:\Program Files\Python311\python.exe",
+            "C:\Program Files (x86)\Python311\python.exe",
+            "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe"
+          )
+
+          $py = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $py = $c; break }
+          }
+
+          if (-not $py) {
+            Write-Host "❌ Python not found in known locations."
+            exit 1
+          }
+
+          "PY=$py" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "✅ Using Python: $py"
+          & $py --version
+          & $py -m pip --version
 
       - name: Create venv + install deps
         shell: powershell
         run: |
-          py -3.11 -m venv .venv
+          & $env:PY -m venv .venv
           .\.venv\Scripts\python -m pip install --upgrade pip
           .\.venv\Scripts\python -m pip install -r requirements.txt
 
@@ -32,6 +50,11 @@ jobs:
         shell: powershell
         run: |
           .\.venv\Scripts\python generate_sitemap.py
+
+      - name: Git sanity check
+        shell: powershell
+        run: |
+          git --version
 
       - name: Commit changes
         shell: powershell
