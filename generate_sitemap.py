@@ -8,6 +8,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timezone, date
 from xml.sax.saxutils import escape
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -17,9 +18,10 @@ from bs4 import BeautifulSoup
 # CONFIG
 # =========================
 SHOP_USER = "WearWink"
+
 TARGET_URLS_DEFAULT = 1100
 
-# Discovery: klein halten (RB blockt oft)
+# Discovery (best effort; RB blockt oft)
 EXPLORE_PAGES_TO_SCAN = 3
 LISTING_PAGES_PER_CATEGORY_TO_SCAN = 1
 MAX_IA_CODES_PER_DISCOVERY_RUN = 6
@@ -27,6 +29,10 @@ MAX_IA_CODES_PER_DISCOVERY_RUN = 6
 SLEEP_BETWEEN_REQUESTS_SEC = 1.2
 REQUEST_TIMEOUT_SEC = 20
 MAX_RETRIES = 3
+
+# Wenn du wirklich NUR /i/ willst (Mockups), lass True.
+# Wenn du als Notfall auch /shop/ap/<id> erlauben willst, setz False.
+ONLY_I_URLS = True
 
 IA_CODES = [
     "w-dresses",
@@ -80,21 +86,20 @@ DATA_DIR = Path("data")
 PUBLIC_DIR = Path("public")
 DEBUG_DIR = Path("debug")
 
-CACHE_JSON = DATA_DIR / "design_ids.json"
-USED_JSON = DATA_DIR / "used_ids.json"
+URL_POOL_JSON = DATA_DIR / "url_pool.json"
+USED_URLS_JSON = DATA_DIR / "used_urls.json"
 STATE_JSON = DATA_DIR / "state.json"
 
-SEED_URLS = DATA_DIR / "seed_urls.txt"   # <-- DU FÜLLST DAS EINMALIG
+SEED_URLS_TXT = DATA_DIR / "seed_urls.txt"  # hier fügst du neue /i/ URLs ein
 OUT_SITEMAP = PUBLIC_DIR / "sitemap.xml"
 
 
 # =========================
-# REGEX: IDs aus Links
+# URL / Pattern Helpers
 # =========================
+# /i/<product>/<slug>/<id>  (manchmal id.<track>)
+ID_RE_I = re.compile(r"/i/[^\"'\s<>]+/(\d+)(?:[/?#\.\"'\s<>]|$)")
 ID_RE_AP = re.compile(r"/shop/ap/(\d+)")
-ID_RE_I = re.compile(r"/i/[^\"'\s<>]+/(\d+)(?:[/?#\"'\s<>]|$)")
-ID_RE_ANY_NUM = re.compile(r"\b(\d{6,})\b")
-
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -102,6 +107,238 @@ def ensure_dirs() -> None:
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def debug_write(name: str, content: str) -> None:
+    ensure_dirs()
+    (DEBUG_DIR / name).write_text(content, encoding="utf-8", errors="ignore")
+
+
+def normalize_rb_url(url: str) -> str | None:
+    """
+    Normalisiert auf https://www.redbubble.com/<path>
+    Filtert alles raus, was keine Produktseite ist.
+    """
+    if not url:
+        return None
+
+    u = url.strip()
+    if not u:
+        return None
+
+    if u.startswith("//"):
+        u = "https:" + u
+    if u.startswith("/"):
+        u = "https://www.redbubble.com" + u
+
+    try:
+        p = urlparse(u)
+    except Exception:
+        return None
+
+    host = (p.netloc or "").lower()
+    if "redbubble.com" not in host:
+        return None
+
+    path = p.path or ""
+    # Erlaubt:
+    # - /i/...
+    # - optional /shop/ap/...
+    if path.startswith("/i/"):
+        pass
+    elif path.startswith("/shop/ap/"):
+        if ONLY_I_URLS:
+            return None
+    else:
+        return None
+
+    return f"https://www.redbubble.com{path}"
+
+
+def is_i_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return (p.path or "").startswith("/i/")
+    except Exception:
+        return False
+
+
+def extract_product_urls_from_html(html: str) -> list[str]:
+    """
+    Extrahiert Produktseiten-URLs aus HTML:
+    - /i/...
+    - optional /shop/ap/...
+    """
+    out: list[str] = []
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.find_all("a", href=True):
+            href = a.get("href")
+            if not isinstance(href, str):
+                continue
+            nu = normalize_rb_url(href)
+            if nu:
+                out.append(nu)
+    except Exception:
+        pass
+
+    # Dedupe order-preserving
+    seen = set()
+    dedup: list[str] = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            dedup.append(u)
+    return dedup
+
+
+# =========================
+# JSON storage
+# =========================
+def load_json(path: Path, default: dict) -> dict:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json(path: Path, obj: dict) -> None:
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def pool_add_urls(urls: list[str], source: str) -> int:
+    """
+    data/url_pool.json:
+    {
+      "urls": {
+        "<url>": {"first_seen": "...", "last_seen": "...", "source": "...", "id": "123"}
+      },
+      "meta": {...}
+    }
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    data = load_json(URL_POOL_JSON, {"urls": {}, "meta": {}})
+    urls_map = data.get("urls", {})
+    if not isinstance(urls_map, dict):
+        urls_map = {}
+
+    added = 0
+    for u in urls:
+        nu = normalize_rb_url(u)
+        if not nu:
+            continue
+
+        pid = None
+        m = ID_RE_I.search(nu) or ID_RE_AP.search(nu)
+        if m:
+            pid = m.group(1)
+
+        if nu not in urls_map:
+            urls_map[nu] = {"first_seen": now, "last_seen": now, "source": source, "id": pid}
+            added += 1
+        else:
+            if isinstance(urls_map[nu], dict):
+                urls_map[nu]["last_seen"] = now
+
+    data["urls"] = urls_map
+    data.setdefault("meta", {})
+    data["meta"]["updated_at"] = now
+    save_json(URL_POOL_JSON, data)
+    return added
+
+
+def load_pool_urls() -> list[str]:
+    data = load_json(URL_POOL_JSON, {"urls": {}})
+    urls_map = data.get("urls", {})
+    if not isinstance(urls_map, dict):
+        return []
+    return list(urls_map.keys())
+
+
+def load_used_urls() -> set[str]:
+    data = load_json(USED_URLS_JSON, {"used": [], "last_reset": None})
+    used = data.get("used", [])
+    if not isinstance(used, list):
+        used = []
+    return {u for u in used if isinstance(u, str)}
+
+
+def save_used_urls(used: set[str], last_reset: str | None = None) -> None:
+    save_json(USED_URLS_JSON, {"used": sorted(used), "last_reset": last_reset})
+
+
+# =========================
+# Rotation
+# =========================
+def pick_rotating_urls(all_urls: list[str], used: set[str], target: int) -> tuple[list[str], set[str], bool]:
+    if not all_urls:
+        return [], used, False
+
+    all_set = set(all_urls)
+    used = {u for u in used if u in all_set}
+
+    available = [u for u in all_urls if u not in used]
+    did_reset = False
+
+    if len(available) < target:
+        used = set()
+        available = all_urls[:]
+        did_reset = True
+
+    seed = int(date.today().strftime("%Y%m%d"))
+    rng = random.Random(seed)
+    rng.shuffle(available)
+
+    picked = available[: min(target, len(available))]
+    used.update(picked)
+    return picked, used, did_reset
+
+
+def write_sitemap(urls: list[str]) -> None:
+    lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ]
+    for u in urls:
+        lines.append("  <url>")
+        lines.append(f"    <loc>{escape(u)}</loc>")
+        lines.append(f"    <lastmod>{lastmod}</lastmod>")
+        lines.append("  </url>")
+    lines.append("</urlset>")
+    OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# =========================
+# Seed import (every run)
+# =========================
+def load_seed_urls() -> list[str]:
+    if not SEED_URLS_TXT.exists():
+        return []
+    lines = [
+        l.strip()
+        for l in SEED_URLS_TXT.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if l.strip()
+    ]
+    out: list[str] = []
+    for line in lines:
+        nu = normalize_rb_url(line)
+        if nu:
+            out.append(nu)
+
+    # dedupe
+    seen = set()
+    dedup = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            dedup.append(u)
+    return dedup
+
+
+# =========================
+# Discovery (best effort)
+# =========================
 def session() -> requests.Session:
     s = requests.Session()
     s.headers.update(
@@ -113,7 +350,6 @@ def session() -> requests.Session:
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "DNT": "1",
@@ -123,12 +359,7 @@ def session() -> requests.Session:
     return s
 
 
-def debug_write(name: str, content: str) -> None:
-    ensure_dirs()
-    (DEBUG_DIR / name).write_text(content, encoding="utf-8", errors="ignore")
-
-
-def is_blocked_response(status: int, html: str) -> bool:
+def looks_blocked(status: int, html: str) -> bool:
     if status in (403, 429):
         return True
     low = (html or "").lower()
@@ -151,7 +382,7 @@ def fetch_html(s: requests.Session, url: str, debug_name: str) -> str | None:
             r = s.get(url, timeout=REQUEST_TIMEOUT_SEC, allow_redirects=True)
             text = r.text or ""
 
-            if is_blocked_response(r.status_code, text):
+            if looks_blocked(r.status_code, text) or not text.strip():
                 debug_write(f"{debug_name}_blocked_status{r.status_code}.html", text)
                 return None
 
@@ -160,15 +391,10 @@ def fetch_html(s: requests.Session, url: str, debug_name: str) -> str | None:
                 time.sleep(1.5 * attempt)
                 continue
 
-            if not text.strip():
-                debug_write(f"{debug_name}_empty.html", text)
-                return None
-
             if debug_name.endswith("_p1"):
                 debug_write(f"{debug_name}.html", text)
 
             return text
-
         except Exception as e:
             last_err = str(e)
             time.sleep(1.5 * attempt)
@@ -176,125 +402,6 @@ def fetch_html(s: requests.Session, url: str, debug_name: str) -> str | None:
     if last_err:
         debug_write(f"{debug_name}_error.txt", last_err)
     return None
-
-
-def extract_ids_from_html(html: str) -> list[str]:
-    ids: list[str] = []
-    ids.extend(ID_RE_AP.findall(html))
-    ids.extend(ID_RE_I.findall(html))
-
-    try:
-        soup = BeautifulSoup(html, "lxml")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if isinstance(href, str):
-                ids.extend(ID_RE_AP.findall(href))
-                ids.extend(ID_RE_I.findall(href))
-    except Exception:
-        pass
-
-    seen: set[str] = set()
-    out: list[str] = []
-    for x in ids:
-        if x and x.isdigit() and x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
-def load_json(path: Path, default: dict) -> dict:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-def save_json(path: Path, obj: dict) -> None:
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def load_cache_ids() -> list[str]:
-    data = load_json(CACHE_JSON, {"ids": {}})
-    ids_map = data.get("ids", {}) if isinstance(data.get("ids", {}), dict) else {}
-    return [k for k in ids_map.keys() if isinstance(k, str) and k.isdigit()]
-
-
-def upsert_cache_ids(new_ids: list[str], source: str) -> int:
-    now = datetime.now(timezone.utc).isoformat()
-    data = load_json(CACHE_JSON, {"ids": {}, "meta": {}})
-    ids_map = data.get("ids", {})
-    if not isinstance(ids_map, dict):
-        ids_map = {}
-
-    added = 0
-    for pid in new_ids:
-        if not isinstance(pid, str) or not pid.isdigit():
-            continue
-        if pid not in ids_map:
-            ids_map[pid] = {"first_seen": now, "last_seen": now, "source": source}
-            added += 1
-        else:
-            if isinstance(ids_map[pid], dict):
-                ids_map[pid]["last_seen"] = now
-
-    data["ids"] = ids_map
-    data.setdefault("meta", {})
-    data["meta"]["updated_at"] = now
-    save_json(CACHE_JSON, data)
-    return added
-
-
-def load_used_set() -> set[str]:
-    data = load_json(USED_JSON, {"used": [], "last_reset": None})
-    used = data.get("used", [])
-    if not isinstance(used, list):
-        used = []
-    return {u for u in used if isinstance(u, str) and u.isdigit()}
-
-
-def save_used_set(used: set[str], last_reset: str | None = None) -> None:
-    save_json(USED_JSON, {"used": sorted(used), "last_reset": last_reset})
-
-
-def pick_rotating_ids(all_ids: list[str], used_ids: set[str], target: int) -> tuple[list[str], set[str], bool]:
-    if not all_ids:
-        return [], used_ids, False
-
-    all_set = set(all_ids)
-    used_ids = {u for u in used_ids if u in all_set}
-
-    available = [i for i in all_ids if i not in used_ids]
-    did_reset = False
-
-    if len(available) < target:
-        used_ids = set()
-        available = all_ids[:]
-        did_reset = True
-
-    seed = int(date.today().strftime("%Y%m%d"))
-    rng = random.Random(seed)
-    rng.shuffle(available)
-
-    picked = available[: min(target, len(available))]
-    used_ids.update(picked)
-    return picked, used_ids, did_reset
-
-
-def write_sitemap(product_urls: list[str]) -> None:
-    lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
-    ]
-    for u in product_urls:
-        lines.append("  <url>")
-        lines.append(f"    <loc>{escape(u)}</loc>")
-        lines.append(f"    <lastmod>{lastmod}</lastmod>")
-        lines.append("  </url>")
-    lines.append("</urlset>")
-    OUT_SITEMAP.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def choose_ia_codes_for_run() -> list[str]:
@@ -311,11 +418,12 @@ def choose_ia_codes_for_run() -> list[str]:
     return chosen
 
 
-def discover_design_ids() -> tuple[list[str], bool]:
+def discover_urls() -> tuple[list[str], bool]:
     s = session()
     found: list[str] = []
     blocked_any = False
 
+    # Explore
     for p in range(1, EXPLORE_PAGES_TO_SCAN + 1):
         url = EXPLORE_URL.format(page=p)
         html = fetch_html(s, url, debug_name=f"explore_p{p}")
@@ -323,13 +431,20 @@ def discover_design_ids() -> tuple[list[str], bool]:
             print(f"WARN: blocked/empty explore page={p}")
             blocked_any = True
             break
-        ids = extract_ids_from_html(html)
-        if not ids:
-            print(f"INFO: no ids on explore page={p} (stop explore)")
+
+        urls = extract_product_urls_from_html(html)
+        # Filter: wenn ONLY_I_URLS -> nur /i/
+        if ONLY_I_URLS:
+            urls = [u for u in urls if is_i_url(u)]
+
+        if not urls:
+            print(f"INFO: no product urls on explore page={p}")
             break
-        found.extend(ids)
+
+        found.extend(urls)
         time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
 
+    # Listing by IA codes
     for ia in choose_ia_codes_for_run():
         for p in range(1, LISTING_PAGES_PER_CATEGORY_TO_SCAN + 1):
             url = LISTING_URL.format(page=p, ia=ia)
@@ -338,112 +453,94 @@ def discover_design_ids() -> tuple[list[str], bool]:
                 print(f"WARN: blocked/empty ia={ia} page={p}")
                 blocked_any = True
                 break
-            ids = extract_ids_from_html(html)
-            if not ids:
-                print(f"INFO: no ids ia={ia} page={p} (stop ia)")
+
+            urls = extract_product_urls_from_html(html)
+            if ONLY_I_URLS:
+                urls = [u for u in urls if is_i_url(u)]
+
+            if not urls:
+                print(f"INFO: no product urls ia={ia} page={p}")
                 break
-            found.extend(ids)
+
+            found.extend(urls)
             time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
 
-    seen: set[str] = set()
-    out: list[str] = []
-    for i in found:
-        if i not in seen:
-            seen.add(i)
-            out.append(i)
+    # Dedupe order-preserving
+    seen = set()
+    out = []
+    for u in found:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
     return out, blocked_any
 
 
-def load_seed_ids() -> list[str]:
-    """
-    Liest data/seed_urls.txt und extrahiert IDs.
-    Akzeptiert:
-    - https://www.redbubble.com/shop/ap/<id>
-    - https://www.redbubble.com/i/.../<id>
-    - oder nur rohe Zahlen in der Zeile
-    """
-    if not SEED_URLS.exists():
-        return []
-    lines = [l.strip() for l in SEED_URLS.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
-
-    ids: list[str] = []
-    for line in lines:
-        ids.extend(ID_RE_AP.findall(line))
-        ids.extend(ID_RE_I.findall(line))
-        if not ids:
-            m = ID_RE_ANY_NUM.findall(line)
-            ids.extend(m)
-
-    out = []
-    seen = set()
-    for x in ids:
-        if x and x.isdigit() and x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
+# =========================
+# MAIN
+# =========================
 def main() -> int:
     ensure_dirs()
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--discover", action="store_true")
-    ap.add_argument("--build", action="store_true")
+    ap.add_argument("--discover", action="store_true", help="Try to discover new /i/ URLs (best effort)")
+    ap.add_argument("--build", action="store_true", help="Build sitemap.xml from pool")
     ap.add_argument("--target", type=int, default=TARGET_URLS_DEFAULT)
     args = ap.parse_args()
 
-    run_discover = args.discover or (not args.discover and not args.build)
+    # Default: do build (and not discover) unless requested
+    run_discover = args.discover
     run_build = args.build or (not args.discover and not args.build)
 
-    # 0) Seed in Cache bringen (wenn Cache leer)
-    cached_ids = load_cache_ids()
-    if not cached_ids:
-        seed_ids = load_seed_ids()
-        if seed_ids:
-            added = upsert_cache_ids(seed_ids, source="seed_urls")
-            print(f"OK: seeded cache from {SEED_URLS} | ids={len(seed_ids)} | added_new={added}")
-        else:
-            print(f"INFO: cache empty and no seed file or no IDs in {SEED_URLS}")
+    # 0) Seed import EVERY run
+    seed_urls = load_seed_urls()
+    if seed_urls:
+        added = pool_add_urls(seed_urls, source="seed_urls")
+        print(f"OK: imported seed_urls.txt | urls_in_file={len(seed_urls)} | added_new={added}")
+    else:
+        print("INFO: seed_urls.txt empty or missing (no seed import)")
 
-    # 1) Discovery (best effort)
+    # 1) Discovery (optional)
     if run_discover:
-        new_ids, blocked_any = discover_design_ids()
-        if new_ids:
-            added = upsert_cache_ids(new_ids, source="auto_discovery")
-            print(f"OK: discovery found={len(new_ids)} | added_new={added}")
+        new_urls, blocked_any = discover_urls()
+        if new_urls:
+            added = pool_add_urls(new_urls, source="auto_discovery")
+            print(f"OK: discovery found={len(new_urls)} | added_new={added}")
         else:
-            print("WARN: discovery returned 0 IDs.")
+            print("WARN: discovery returned 0 URLs.")
             if blocked_any:
-                print("WARN: looks blocked/empty. See debug/*.html for details.")
+                print("WARN: looks blocked/empty. Check debug/*.html")
 
-    # 2) Build sitemap (stabil)
+    # 2) Build sitemap
     if run_build:
-        cached_ids = load_cache_ids()
-        used_ids = load_used_set()
+        pool = load_pool_urls()
+        used = load_used_urls()
 
-        if not cached_ids:
-            # Wenn noch keine IDs: nur dann failen, wenn sitemap auch nicht existiert
+        if not pool:
+            # If sitemap already exists, keep it
             if OUT_SITEMAP.exists() and OUT_SITEMAP.stat().st_size > 200:
-                print("WARN: cache empty, but sitemap exists -> keeping existing sitemap.xml (exit 0).")
+                print("WARN: url pool empty, but sitemap exists -> keeping existing sitemap.xml (exit 0).")
                 return 0
-            print("ERROR: cache empty AND no existing sitemap.xml. Run discovery or seed cache first.")
+            print("ERROR: url pool empty AND no existing sitemap.xml. Add /i/ URLs to data/seed_urls.txt.")
             return 1
 
-        picked, used_ids, did_reset = pick_rotating_ids(cached_ids, used_ids, args.target)
+        # Effective target: nicht größer als Pool
+        effective_target = min(args.target, len(pool))
+
+        picked, used, did_reset = pick_rotating_urls(pool, used, effective_target)
         if not picked:
             if OUT_SITEMAP.exists() and OUT_SITEMAP.stat().st_size > 200:
-                print("WARN: could not pick ids, keeping existing sitemap.xml (exit 0).")
+                print("WARN: could not pick urls, keeping existing sitemap.xml (exit 0).")
                 return 0
-            print("ERROR: could not pick any IDs.")
+            print("ERROR: could not pick any urls.")
             return 1
 
-        product_urls = [f"https://www.redbubble.com/shop/ap/{pid}" for pid in picked]
-        write_sitemap(product_urls)
+        write_sitemap(picked)
 
-        reset_ts = datetime.now(timezone.utc).isoformat() if did_reset else load_json(USED_JSON, {"last_reset": None}).get("last_reset")
-        save_used_set(used_ids, last_reset=reset_ts)
+        reset_ts = datetime.now(timezone.utc).isoformat() if did_reset else load_json(USED_URLS_JSON, {"last_reset": None}).get("last_reset")
+        save_used_urls(used, last_reset=reset_ts)
 
-        print(f"OK: wrote {len(product_urls)} product URLs to {OUT_SITEMAP}")
+        print(f"OK: wrote {len(picked)} product URLs to {OUT_SITEMAP}")
+        print(f"INFO: pool_size={len(pool)} | used_size={len(used)} | only_i_urls={ONLY_I_URLS}")
         return 0
 
     return 0
