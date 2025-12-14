@@ -27,6 +27,7 @@ jobs:
         run: |
           $candidates = @(
             "C:\Python311\python.exe",
+            "C:\Program Files\Python311\python.exe",
             "C:\Windows\py.exe"
           )
 
@@ -36,7 +37,7 @@ jobs:
           }
 
           if (-not $PY) {
-            Write-Host "❌ Python not found."
+            Write-Host "❌ Python not found in known locations."
             exit 1
           }
 
@@ -56,12 +57,12 @@ jobs:
         run: |
           .\.venv\Scripts\python.exe -m playwright install chromium
 
-      - name: Generate sitemap (seed -> playwright discover -> build)
+      - name: Generate sitemap (discover + build)
         shell: pwsh
         run: |
           .\.venv\Scripts\python.exe .\generate_sitemap.py --discover-playwright --pw-per-run 10 --build --target 1100
 
-      - name: Upload debug artifacts
+      - name: Upload debug artifact (optional)
         uses: actions/upload-artifact@v4
         with:
           name: debug-output
@@ -71,13 +72,15 @@ jobs:
             public/**
           if-no-files-found: warn
 
-      - name: Commit changes
+      - name: Commit changes (keep repo clean)
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add public/sitemap.xml data/*.json data/seed_urls.txt debug/* requirements.txt generate_sitemap.py .github/workflows/update.yml 2>$null
+          git add generate_sitemap.py requirements.txt .gitignore
+          git add public/sitemap.xml
+          git add data/seed_urls.txt data/url_pool.json data/used_urls.json data/design_ids.json data/state.json 2>$null
 
           if (git diff --cached --quiet) {
             Write-Host "No changes to commit."
