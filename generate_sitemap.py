@@ -8,7 +8,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timezone, date
 from xml.sax.saxutils import escape
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -25,20 +25,14 @@ TARGET_URLS_DEFAULT = 1100
 # Sitemap nur /i/ URLs für Mockups
 ONLY_I_URLS = True
 
-# Seed wird JEDEN Run importiert
+# Seed wird JEDEN Run importiert (damit neue Designs sofort rein können)
 SEED_URLS_TXT = Path("data/seed_urls.txt")
 
-# Playwright Discovery (inkrementell / langsam)
+# Playwright Discovery (inkrementell, damit weniger Block)
 PW_DESIGNS_PER_RUN_DEFAULT = 10
 PW_SLEEP_MIN = 2.0
 PW_SLEEP_MAX = 4.5
 PW_HEADLESS_DEFAULT = True
-
-# Requests Discovery (optional)
-EXPLORE_PAGES_TO_SCAN = 2
-REQUEST_TIMEOUT_SEC = 20
-MAX_RETRIES = 2
-SLEEP_BETWEEN_REQUESTS_SEC = 1.2
 
 # Repo structure
 DATA_DIR = Path("data")
@@ -54,16 +48,25 @@ OUT_SITEMAP = PUBLIC_DIR / "sitemap.xml"
 
 
 # =========================
-# Patterns
+# REGEX
 # =========================
 ID_RE_I = re.compile(r"/i/[^\"'\s<>]+/(\d+)(?:[/?#\.\"'\s<>]|$)")
 ID_RE_AP = re.compile(r"/shop/ap/(\d+)(?:[/?#]|$)")
 ID_RE_ANY_NUM = re.compile(r"\b(\d{6,})\b")
 
+# Redbubble masking: https:{{%2F}}{{%2F}}www.redbubble.com{{%2F}}i{{%2F}}...
+_RB_ESC = re.compile(r"\{\{%([0-9A-Fa-f]{2})\}\}")
+
 
 # =========================
-# FS helpers
+# HELPERS
 # =========================
+def rb_unescape(text: str) -> str:
+    # macht aus "{{%2F}}" -> "%2F" und decodiert dann -> "/"
+    t = _RB_ESC.sub(lambda m: "%" + m.group(1), text)
+    return unquote(t)
+
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,13 +91,21 @@ def save_json(path: Path, obj: dict) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-# =========================
-# URL normalize + filters
-# =========================
+def is_i_url(url: str) -> bool:
+    try:
+        return (urlparse(url).path or "").startswith("/i/")
+    except Exception:
+        return False
+
+
 def normalize_rb_url(url: str) -> str | None:
+    """
+    Normalisiert auf https://www.redbubble.com/<path>
+    Erlaubt nur /i/... URLs (wenn ONLY_I_URLS=True)
+    """
     if not url:
         return None
-    u = url.strip()
+    u = rb_unescape(url.strip())
     if not u:
         return None
 
@@ -114,38 +125,30 @@ def normalize_rb_url(url: str) -> str | None:
 
     path = p.path or ""
     if path.startswith("/i/"):
-        pass
-    elif path.startswith("/shop/ap/"):
-        if ONLY_I_URLS:
-            return None
-    else:
-        return None
+        return f"https://www.redbubble.com{path}"
 
-    return f"https://www.redbubble.com{path}"
+    if not ONLY_I_URLS and path.startswith("/shop/ap/"):
+        return f"https://www.redbubble.com{path}"
 
-
-def is_i_url(url: str) -> bool:
-    try:
-        return (urlparse(url).path or "").startswith("/i/")
-    except Exception:
-        return False
+    return None
 
 
 def extract_design_id_from_text(text: str) -> str | None:
-    m = ID_RE_I.search(text)
+    t = rb_unescape(text)
+    m = ID_RE_I.search(t)
     if m:
         return m.group(1)
-    m = ID_RE_AP.search(text)
+    m = ID_RE_AP.search(t)
     if m:
         return m.group(1)
-    m = ID_RE_ANY_NUM.search(text)
+    m = ID_RE_ANY_NUM.search(t)
     if m:
         return m.group(1)
     return None
 
 
 # =========================
-# Pool: urls
+# POOL URLS
 # =========================
 def pool_add_urls(urls: list[str], source: str) -> int:
     now = datetime.now(timezone.utc).isoformat()
@@ -185,7 +188,7 @@ def load_pool_urls() -> list[str]:
 
 
 # =========================
-# used urls
+# USED URLS
 # =========================
 def load_used_urls() -> set[str]:
     data = load_json(USED_URLS_JSON, {"used": [], "last_reset": None})
@@ -200,7 +203,7 @@ def save_used_urls(used: set[str], last_reset: str | None = None) -> None:
 
 
 # =========================
-# design ids store
+# DESIGN IDS
 # =========================
 def ids_add(ids: list[str], source: str) -> int:
     now = datetime.now(timezone.utc).isoformat()
@@ -233,13 +236,11 @@ def load_all_ids_unique() -> list[str]:
     if not isinstance(ids_map, dict):
         return []
     ids = [k for k in ids_map.keys() if isinstance(k, str) and k.isdigit()]
-    # unique + stable order
-    ids = sorted(set(ids))
-    return ids
+    return sorted(set(ids))
 
 
 # =========================
-# Rotation + sitemap
+# ROTATION + SITEMAP
 # =========================
 def pick_rotating_urls(all_urls: list[str], used: set[str], target: int) -> tuple[list[str], set[str], bool]:
     if not all_urls:
@@ -281,7 +282,7 @@ def write_sitemap(urls: list[str]) -> None:
 
 
 # =========================
-# Seed import (EVERY run)
+# SEED IMPORT
 # =========================
 def load_seed_urls() -> list[str]:
     if not SEED_URLS_TXT.exists():
@@ -297,7 +298,6 @@ def load_seed_urls() -> list[str]:
         if nu:
             out.append(nu)
 
-    # dedupe
     seen = set()
     dedup = []
     for u in out:
@@ -308,7 +308,7 @@ def load_seed_urls() -> list[str]:
 
 
 # =========================
-# Playwright discovery: /shop/ap/<id> -> collect /i/ links
+# PLAYWRIGHT DISCOVERY
 # =========================
 def load_state() -> dict:
     return load_json(STATE_JSON, {"pw_id_cursor": 0})
@@ -323,57 +323,67 @@ def sleep_random() -> None:
 
 
 def pw_collect_i_urls_for_design(context, design_id: str) -> list[str]:
+    """
+    Öffnet /shop/ap/<id> und sammelt /i/ URLs.
+    RB liefert URLs oft maskiert: https:{{%2F}}{{%2F}}...
+    -> wir normalisieren über rb_unescape(html).
+    """
     url = f"https://www.redbubble.com/shop/ap/{design_id}"
     page = context.new_page()
 
+    def is_block_html(html: str) -> bool:
+        low = (html or "").lower()
+        return any(x in low for x in ["captcha", "verify you are human", "/cdn-cgi/", "access denied", "request blocked"])
+
     try:
-        resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        resp = page.goto(url, wait_until="networkidle", timeout=60000)
         status = resp.status if resp else None
 
-        # Versuch: auf Links warten (kann failen, dann trotzdem weitermachen)
-        try:
-            page.wait_for_selector('a[href*="/i/"]', timeout=5000)
-        except Exception:
-            pass
-
-        # Scroll ein paar Mal (lazy load)
-        for _ in range(5):
+        # Lazy load / Render
+        for _ in range(6):
             try:
-                page.mouse.wheel(0, 1600)
+                page.mouse.wheel(0, 1700)
             except Exception:
                 pass
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(800)
 
         html = page.content() or ""
-        low = html.lower()
-        if any(x in low for x in ["captcha", "verify you are human", "/cdn-cgi/", "access denied", "request blocked"]):
-            debug_write(f"pw_ap_{design_id}_blocked.html", html)
-            return []
+        html_norm = rb_unescape(html)
 
-        if status in (403, 429):
-            debug_write(f"pw_ap_{design_id}_status{status}.html", html)
-            return []
+        # Wenn block, speichern wir Debug - versuchen aber trotzdem zu extrahieren
+        if status in (403, 429) or is_block_html(html_norm):
+            debug_write(f"pw_ap_{design_id}_blocked.html", html)
 
         urls: list[str] = []
 
-        # A) DOM hrefs
+        # A) DOM hrefs (falls vorhanden)
         try:
             hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.getAttribute('href'))")
             for h in hrefs:
-                if isinstance(h, str) and "/i/" in h:
-                    nu = normalize_rb_url(h)
-                    if nu and is_i_url(nu):
-                        urls.append(nu)
+                if isinstance(h, str):
+                    h2 = rb_unescape(h)
+                    if "/i/" in h2:
+                        nu = normalize_rb_url(h2)
+                        if nu and is_i_url(nu):
+                            urls.append(nu)
         except Exception:
             pass
 
-        # B) Regex aus HTML (falls Links nicht als echte anchors vorhanden sind)
-        for m in re.finditer(r'href="([^"]+)"', html):
-            h = m.group(1)
-            if "/i/" in h:
-                nu = normalize_rb_url(h)
+        # B) aus HTML (auch JSON/Script)
+        try:
+            # absolute
+            for m in re.findall(r"https?://www\.redbubble\.com/i/[^\"'\s<>]+", html_norm):
+                nu = normalize_rb_url(m)
                 if nu and is_i_url(nu):
                     urls.append(nu)
+
+            # relative
+            for m in re.findall(r"(/i/[^\"'\s<>]+)", html_norm):
+                nu = normalize_rb_url(m)
+                if nu and is_i_url(nu):
+                    urls.append(nu)
+        except Exception:
+            pass
 
         # dedupe
         seen = set()
@@ -387,6 +397,7 @@ def pw_collect_i_urls_for_design(context, design_id: str) -> list[str]:
             debug_write(f"pw_ap_{design_id}_no_i_links.html", html)
 
         return dedup
+
     finally:
         try:
             page.close()
@@ -397,13 +408,12 @@ def pw_collect_i_urls_for_design(context, design_id: str) -> list[str]:
 def discover_with_playwright(headless: bool, per_run: int) -> tuple[int, int]:
     all_ids = load_all_ids_unique()
     if not all_ids:
-        print("INFO: no design IDs available for Playwright discovery (seed different designs first).")
+        print("INFO: no design IDs available for Playwright discovery (seed at least 1 /i/ URL).")
         return 0, 0
 
     st = load_state()
     cursor = int(st.get("pw_id_cursor", 0)) if str(st.get("pw_id_cursor", "0")).isdigit() else 0
 
-    # Unique batch ohne Wiederholungen
     batch = []
     i = 0
     while len(batch) < min(per_run, len(all_ids)) and i < len(all_ids) * 2:
@@ -413,7 +423,6 @@ def discover_with_playwright(headless: bool, per_run: int) -> tuple[int, int]:
         i += 1
 
     new_cursor = (cursor + len(batch)) % len(all_ids)
-
     urls_added_total = 0
 
     with sync_playwright() as p:
@@ -439,7 +448,7 @@ def discover_with_playwright(headless: bool, per_run: int) -> tuple[int, int]:
                     urls_added_total += added
                     print(f"PW: design {did} -> found {len(urls)} /i/ links | added_new={added}")
                 else:
-                    print(f"PW: design {did} -> no /i/ links (maybe blocked or not rendered)")
+                    print(f"PW: design {did} -> no /i/ links (blocked or not renderable)")
                 sleep_random()
         finally:
             try:
@@ -482,7 +491,7 @@ def main() -> int:
     else:
         print("INFO: seed_urls.txt empty or missing (no seed import)")
 
-    # IDs aus URL pool ableiten (damit Playwright was hat)
+    # IDs aus URL pool ableiten
     pool_urls_now = load_pool_urls()
     derived_ids = []
     for u in pool_urls_now:
@@ -491,13 +500,13 @@ def main() -> int:
             derived_ids.append(pid)
     ids_add(derived_ids, source="from_url_pool")
 
-    # 1) Playwright discover optional
+    # 1) Playwright discovery
     if args.discover_playwright:
         headless = (not args.pw_headful) and PW_HEADLESS_DEFAULT
         processed, urls_added = discover_with_playwright(headless=headless, per_run=args.pw_per_run)
         print(f"OK: playwright processed_designs={processed} | urls_added_new={urls_added}")
 
-    # 2) Build
+    # 2) Build sitemap
     if run_build:
         pool = load_pool_urls()
         used = load_used_urls()
@@ -514,6 +523,7 @@ def main() -> int:
 
         effective_target = min(args.target, len(pool))
         picked, used, did_reset = pick_rotating_urls(pool, used, effective_target)
+
         write_sitemap(picked)
 
         reset_ts = datetime.now(timezone.utc).isoformat() if did_reset else load_json(USED_URLS_JSON, {"last_reset": None}).get("last_reset")
