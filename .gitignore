@@ -3,9 +3,12 @@ __pycache__/
 *.pyc
 .venv/
 
-# Debug & artifacts lokal (im Repo willst du debug/ aber nur .gitkeep + ausgewählte html)
-*.zip
+# Playwright persistent profile (RIESIG, darf NICHT committed werden)
+data/pw_profile/
+
+# Debug (optional: wenn du debug html nicht committen willst)
+# debug/*.html
 
 # OS
-.DS_Store
 Thumbs.db
+.DS_Store
