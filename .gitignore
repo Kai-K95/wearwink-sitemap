@@ -1,2 +1,11 @@
-debug/*
-!debug/.gitkeep
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Debug & artifacts lokal (im Repo willst du debug/ aber nur .gitkeep + ausgewählte html)
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
